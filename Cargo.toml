@@ -1,0 +1,22 @@
+[package]
+name = "skills-sync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Keeps one folder of agent skills linked into every skills folder that should have them"
+repository = "https://github.com/alexcrisan1611/skills-sync"
+readme = "README.md"
+
+[dependencies]
+notify = "8.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+[target.'cfg(windows)'.dependencies]
+junction = "2.1.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
