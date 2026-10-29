@@ -1,13 +1,13 @@
-# Installs the latest skills-sync release on Windows:
-#   irm https://github.com/alexcrisan1611/skills-sync/releases/latest/download/install.ps1 | iex
+# Installs the latest skillster release on Windows:
+#   irm https://github.com/alexcrisan1611/skillster/releases/latest/download/install.ps1 | iex
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
 
-    $base = 'https://github.com/alexcrisan1611/skills-sync/releases/latest/download'
+    $base = 'https://github.com/alexcrisan1611/skillster/releases/latest/download'
     # x64 builds also run on ARM64 under emulation, but use the native one when we can tell.
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-    $name = "skills-sync-$arch-pc-windows-msvc"
+    $name = "skillster-$arch-pc-windows-msvc"
 
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid())
     New-Item -ItemType Directory $tmp | Out-Null
@@ -22,8 +22,8 @@
         if (-not $expected -or $expected -ne $actual.ToLower()) { throw "checksum mismatch for $name.zip" }
 
         Expand-Archive "$tmp\$name.zip" $tmp
-        & "$tmp\$name\skills-sync.exe" install @args
-        if ($LASTEXITCODE -ne 0) { throw "skills-sync install failed (exit code $LASTEXITCODE)" }
+        & "$tmp\$name\skillster.exe" install @args
+        if ($LASTEXITCODE -ne 0) { throw "skillster install failed (exit code $LASTEXITCODE)" }
     } finally {
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }

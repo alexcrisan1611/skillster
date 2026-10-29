@@ -1,8 +1,8 @@
 //! Keeps every skill in a source folder linked (junctions on Windows, symlinks
 //! elsewhere) into each target folder, and removes links whose skill has gone.
 //!
-//! Two binaries share this crate: `skills-sync` (the command line, including the
-//! installer) and `skills-syncd` (the background process).
+//! Two binaries share this crate: `skillster` (the command line, including the
+//! installer) and `skillsterd` (the background process).
 
 pub mod config;
 #[cfg(windows)]

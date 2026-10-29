@@ -5,13 +5,16 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const CLI_EXE: &str = "skills-sync";
-pub const DAEMON_EXE: &str = "skills-syncd";
+use super::LEGACY_NAME;
+
+pub const CLI_EXE: &str = "skillster";
+pub const DAEMON_EXE: &str = "skillsterd";
 
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "io.github.alexcrisan1611.skills-sync";
+const LAUNCHD_LABEL: &str = "io.github.alexcrisan1611.skillster";
 #[cfg(not(target_os = "macos"))]
-const SYSTEMD_UNIT: &str = "skills-syncd.service";
+const SYSTEMD_UNIT: &str = "skillsterd.service";
+
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"))
@@ -26,18 +29,18 @@ fn xdg_dir(var: &str) -> Option<PathBuf> {
     std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
-/// `~/.config/skills-sync` (honouring `$XDG_CONFIG_HOME`).
+/// `~/.config/skillster` (honouring `$XDG_CONFIG_HOME`).
 pub fn config_dir() -> PathBuf {
-    xdg_config_home().join("skills-sync")
+    xdg_config_home().join("skillster")
 }
 
-/// The log and the lock file: `~/Library/Application Support/skills-sync` on macOS,
-/// `~/.local/state/skills-sync` (honouring `$XDG_STATE_HOME`) elsewhere.
+/// The log and the lock file: `~/Library/Application Support/skillster` on macOS,
+/// `~/.local/state/skillster` (honouring `$XDG_STATE_HOME`) elsewhere.
 pub fn state_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
-        home().join("Library").join("Application Support").join("skills-sync")
+        home().join("Library").join("Application Support").join("skillster")
     } else {
-        xdg_dir("XDG_STATE_HOME").unwrap_or_else(|| home().join(".local").join("state")).join("skills-sync")
+        xdg_dir("XDG_STATE_HOME").unwrap_or_else(|| home().join(".local").join("state")).join("skillster")
     }
 }
 
@@ -127,7 +130,7 @@ pub fn native_path(s: &str) -> PathBuf {
 /// Stops the background process, however it was started.
 pub fn stop_daemon() {
     #[cfg(target_os = "macos")]
-    quiet(Command::new("launchctl").args(["bootout", &launchd_target()]));
+    quiet(Command::new("launchctl").args(["bootout", &launchd_target(LAUNCHD_LABEL)]));
     #[cfg(not(target_os = "macos"))]
     quiet(Command::new("systemctl").args(["--user", "stop", SYSTEMD_UNIT]));
     quiet(Command::new("pkill").args(["-x", DAEMON_EXE]));
@@ -136,7 +139,7 @@ pub fn stop_daemon() {
 /// Registers `daemon` to start at login and starts it. Returns where it was registered.
 #[cfg(target_os = "macos")]
 pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, String> {
-    let plist = launch_agent_path();
+    let plist = launch_agent_path(LAUNCHD_LABEL);
     let mut args = vec![daemon.to_path_buf()];
     if let Some(c) = config {
         args.extend([PathBuf::from("--config"), c.to_path_buf()]);
@@ -155,7 +158,7 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
          </dict>\n</plist>\n"
     );
     write_file(&plist, &text)?;
-    quiet(Command::new("launchctl").args(["bootout", &launchd_target()]));
+    quiet(Command::new("launchctl").args(["bootout", &launchd_target(LAUNCHD_LABEL)]));
     let domain = format!("gui/{}", uid()?);
     // `bootout` finishes asynchronously; retry while the old job is still unloading.
     for attempt in 0.. {
@@ -172,8 +175,13 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
 
 #[cfg(target_os = "macos")]
 pub fn disable_autostart() -> Result<(), String> {
-    quiet(Command::new("launchctl").args(["bootout", &launchd_target()]));
-    remove_if_exists(&launch_agent_path())
+    remove_launch_agent(LAUNCHD_LABEL)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_launch_agent(label: &str) -> Result<(), String> {
+    quiet(Command::new("launchctl").args(["bootout", &launchd_target(label)]));
+    remove_if_exists(&launch_agent_path(label))
 }
 
 /// Registers `daemon` to start at login and starts it. Returns where it was registered.
@@ -188,9 +196,9 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
     let command = command.join(" ");
 
     if quiet(Command::new("systemctl").args(["--user", "show-environment"])) {
-        let unit = systemd_unit_path();
+        let unit = systemd_unit_path(SYSTEMD_UNIT);
         let text = format!(
-            "[Unit]\nDescription=skills-sync: keep skills folders linked\n\n\
+            "[Unit]\nDescription=skillster: keep skills folders linked\n\n\
              [Service]\nExecStart={command}\nRestart=on-failure\n\n\
              [Install]\nWantedBy=default.target\n"
         );
@@ -203,9 +211,9 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
         return Ok(format!("systemd user service {SYSTEMD_UNIT}"));
     }
 
-    let entry = autostart_entry_path();
+    let entry = autostart_entry_path(DAEMON_EXE);
     let text = format!(
-        "[Desktop Entry]\nType=Application\nName=skills-sync\nExec={command}\nNoDisplay=true\nTerminal=false\n"
+        "[Desktop Entry]\nType=Application\nName=skillster\nExec={command}\nNoDisplay=true\nTerminal=false\n"
     );
     write_file(&entry, &text)?;
     let mut start = Command::new(daemon);
@@ -225,13 +233,20 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
 
 #[cfg(not(target_os = "macos"))]
 pub fn disable_autostart() -> Result<(), String> {
-    let unit = systemd_unit_path();
+    remove_autostart(DAEMON_EXE)
+}
+
+/// Removes the systemd user service and the autostart entry of `daemon`.
+#[cfg(not(target_os = "macos"))]
+fn remove_autostart(daemon: &str) -> Result<(), String> {
+    let service = format!("{daemon}.service");
+    let unit = systemd_unit_path(&service);
     if unit.exists() {
-        quiet(Command::new("systemctl").args(["--user", "disable", "--now", SYSTEMD_UNIT]));
+        quiet(Command::new("systemctl").args(["--user", "disable", "--now", &service]));
         remove_if_exists(&unit)?;
         quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
     }
-    remove_if_exists(&autostart_entry_path())
+    remove_if_exists(&autostart_entry_path(daemon))
 }
 
 /// Deletes the two binaries from `dir` (`~/.local/bin` holds other programs too).
@@ -240,14 +255,27 @@ pub fn remove_binaries(dir: &Path) -> Result<(), String> {
     remove_if_exists(&dir.join(DAEMON_EXE))
 }
 
-#[cfg(target_os = "macos")]
-fn launch_agent_path() -> PathBuf {
-    home().join("Library").join("LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist"))
+/// Stops and removes an install from before the rename to Skillster: its login
+/// entry, its process and its binaries. Its config is left for `install` to carry over.
+pub fn remove_legacy_install() -> Result<(), String> {
+    let daemon = format!("{LEGACY_NAME}d");
+    #[cfg(target_os = "macos")]
+    remove_launch_agent(&format!("io.github.alexcrisan1611.{LEGACY_NAME}"))?;
+    #[cfg(not(target_os = "macos"))]
+    remove_autostart(&daemon)?;
+    quiet(Command::new("pkill").args(["-x", &daemon]));
+    remove_if_exists(&install_dir().join(LEGACY_NAME))?;
+    remove_if_exists(&install_dir().join(daemon))
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_target() -> String {
-    format!("gui/{}/{LAUNCHD_LABEL}", uid().unwrap_or_default())
+fn launch_agent_path(label: &str) -> PathBuf {
+    home().join("Library").join("LaunchAgents").join(format!("{label}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_target(label: &str) -> String {
+    format!("gui/{}/{label}", uid().unwrap_or_default())
 }
 
 #[cfg(target_os = "macos")]
@@ -262,13 +290,13 @@ fn xml_escape(s: &str) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn systemd_unit_path() -> PathBuf {
-    xdg_config_home().join("systemd").join("user").join(SYSTEMD_UNIT)
+fn systemd_unit_path(unit: &str) -> PathBuf {
+    xdg_config_home().join("systemd").join("user").join(unit)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn autostart_entry_path() -> PathBuf {
-    xdg_config_home().join("autostart").join("skills-syncd.desktop")
+fn autostart_entry_path(daemon: &str) -> PathBuf {
+    xdg_config_home().join("autostart").join(format!("{daemon}.desktop"))
 }
 
 /// One argument of a systemd `ExecStart=` or desktop-entry `Exec=` line.
@@ -314,12 +342,12 @@ mod tests {
         assert_eq!(expand_vars("$HOME/a").unwrap(), format!("{home}/a"));
         assert_eq!(expand_vars("${HOME}x").unwrap(), format!("{home}x"));
         assert_eq!(expand_vars("/a$/b").unwrap(), "/a$/b");
-        assert!(expand_vars("$NO_SUCH_VAR_SKILLS_SYNC/x").is_err());
+        assert!(expand_vars("$NO_SUCH_VAR_SKILLSTER/x").is_err());
     }
 
     #[test]
     fn resolves_relative_links() {
-        let dir = std::env::temp_dir().join(format!("skills-sync-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("skillster-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("a").join("b")).unwrap();
         create_link(Path::new("../../src/x"), &dir.join("a").join("b").join("x")).unwrap();

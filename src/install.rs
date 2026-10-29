@@ -1,4 +1,4 @@
-//! `skills-sync install` and `skills-sync uninstall`.
+//! `skillster install` and `skillster uninstall`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -7,15 +7,16 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{self, ConfigFile};
+use crate::config::{self, ConfigFile, LogFile};
 use crate::{find, pick};
 use crate::logger::Logger;
-use crate::platform::{self, CLI_EXE, DAEMON_EXE, normalize};
+use crate::platform::{self, CLI_EXE, DAEMON_EXE, LEGACY_NAME, normalize};
 use crate::sync::sync;
 
 /// Asks for the folders, writes the config, copies both binaries into
 /// `platform::install_dir()`, registers the background process to start at login,
-/// and starts it.
+/// and starts it. An install from before the rename to Skillster is replaced, its
+/// config carried over.
 pub fn install(config_path: &Path) -> Result<(), String> {
     let here = std::env::current_exe().map_err(|e| format!("cannot locate this program: {e}"))?;
     let daemon_src = here.with_file_name(DAEMON_EXE);
@@ -23,6 +24,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
         return Err(format!("{DAEMON_EXE} must be next to {}", here.display()));
     }
 
+    carry_over_legacy_config(config_path);
     let file = choose_settings(config_path)?;
     let config = file.resolve()?;
     file.write(config_path)?;
@@ -30,6 +32,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 
     let dir = platform::install_dir();
     platform::stop_daemon();
+    platform::remove_legacy_install()?;
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     copy_retrying(&here, &dir.join(CLI_EXE))?;
     copy_retrying(&daemon_src, &dir.join(DAEMON_EXE))?;
@@ -46,7 +49,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
     let on_path = std::env::var_os("PATH")
         .is_some_and(|p| std::env::split_paths(&p).any(|d| normalize(&d) == normalize(&dir)));
     if !on_path {
-        println!("To run `skills-sync` by name, add {} to your PATH.", dir.display());
+        println!("To run `skillster` by name, add {} to your PATH.", dir.display());
     }
     Ok(())
 }
@@ -61,6 +64,23 @@ pub fn uninstall(config_path: &Path) -> Result<(), String> {
     println!("Uninstalled from {}.", dir.display());
     println!("Kept the config ({}) and the links already made.", config_path.display());
     Ok(())
+}
+
+/// Copies the config of a `skills-sync` install to `config_path` when that is the
+/// default and does not exist yet, moving its log to the new default if it used the old.
+fn carry_over_legacy_config(config_path: &Path) {
+    let legacy = platform::config_dir().with_file_name(LEGACY_NAME).join("config.toml");
+    if config_path.exists() || normalize(config_path) != normalize(&config::default_path()) || !legacy.is_file() {
+        return;
+    }
+    let Ok(mut file) = ConfigFile::read(&legacy) else { return };
+    let old_log = platform::state_dir().with_file_name(LEGACY_NAME).join(format!("{LEGACY_NAME}.log"));
+    if file.log.path == config::contract(&old_log) {
+        file.log.path = LogFile::default().path;
+    }
+    if file.write(config_path).is_ok() {
+        println!("Carried over the config of skills-sync ({}).", legacy.display());
+    }
 }
 
 /// The existing config if the user keeps it, else one with freshly chosen folders.

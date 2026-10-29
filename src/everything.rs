@@ -95,7 +95,7 @@ struct ReplyWindow(HWND);
 
 impl ReplyWindow {
     fn new() -> Result<Self, String> {
-        let class = wide("skills-sync-everything-reply");
+        let class = wide("skillster-everything-reply");
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let wc = WNDCLASSW {
             lpfnWndProc: Some(on_message),

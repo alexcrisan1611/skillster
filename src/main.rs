@@ -1,16 +1,16 @@
-//! `skills-sync`: the command line.
+//! `skillster`: the command line.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use skills_sync::config::{self, Config};
-use skills_sync::logger::Logger;
-use skills_sync::{install, sync};
+use skillster::config::{self, Config};
+use skillster::logger::Logger;
+use skillster::{install, sync};
 
 fn usage() -> String {
     format!(
-        "usage: skills-sync <command> [--config <path>]
+        "usage: skillster <command> [--config <path>]
 
 commands:
   install    choose the folders to sync, then install and start the background process
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
                 config_path = Some(PathBuf::from(value));
             }
             "-V" | "--version" | "version" => {
-                println!("skills-sync {}", env!("CARGO_PKG_VERSION"));
+                println!("skillster {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
             "-h" | "--help" | "help" => {

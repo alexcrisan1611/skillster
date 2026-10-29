@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn links_skips_and_prunes() {
-        let root = std::env::temp_dir().join(format!("skills-sync-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("skillster-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let (source, a, b) = (root.join("source"), root.join("a"), root.join("b"));
         for skill in ["alpha", "beta", ".hidden"] {

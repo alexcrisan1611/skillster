@@ -8,11 +8,14 @@ use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
 use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
 
-pub const CLI_EXE: &str = "skills-sync.exe";
-pub const DAEMON_EXE: &str = "skills-syncd.exe";
+use super::LEGACY_NAME;
+
+pub const CLI_EXE: &str = "skillster.exe";
+pub const DAEMON_EXE: &str = "skillsterd.exe";
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_NAME: &str = "skills-sync";
+const RUN_NAME: &str = "skillster";
+
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE is not set"))
@@ -22,17 +25,17 @@ fn local_appdata() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home().join("AppData").join("Local"))
 }
 
-/// `%APPDATA%\skills-sync`.
+/// `%APPDATA%\skillster`.
 pub fn config_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join("AppData").join("Roaming"))
-        .join("skills-sync")
+        .join("skillster")
 }
 
-/// `%LOCALAPPDATA%\skills-sync`: the log and the lock file.
+/// `%LOCALAPPDATA%\skillster`: the log and the lock file.
 pub fn state_dir() -> PathBuf {
-    local_appdata().join("skills-sync")
+    local_appdata().join("skillster")
 }
 
 /// Folders whose subfolders each belong to one app: `%APPDATA%`, `%LOCALAPPDATA%`, and
@@ -41,9 +44,9 @@ pub fn app_data_roots() -> Vec<PathBuf> {
     vec![config_dir().parent().map(Path::to_path_buf).unwrap_or_default(), local_appdata(), home().join(".config")]
 }
 
-/// `%LOCALAPPDATA%\Programs\skills-sync`.
+/// `%LOCALAPPDATA%\Programs\skillster`.
 pub fn install_dir() -> PathBuf {
-    local_appdata().join("Programs").join("skills-sync")
+    local_appdata().join("Programs").join("skillster")
 }
 
 pub fn create_link(src: &Path, dest: &Path) -> io::Result<()> {
@@ -90,17 +93,41 @@ pub fn native_path(s: &str) -> PathBuf {
     PathBuf::from(s.replace('/', "\\"))
 }
 
-/// Stops the background process. Builds from before the CLI/daemon split ran in the
-/// background as skills-sync.exe, so those are stopped too (sparing this process).
+/// Stops the background process.
 pub fn stop_daemon() {
-    let not_me = format!("PID ne {}", std::process::id());
-    for exe in [DAEMON_EXE, CLI_EXE] {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/FI", &format!("IMAGENAME eq {exe}"), "/FI", &not_me])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    kill(DAEMON_EXE);
+}
+
+/// Stops every process running `exe`, sparing this one.
+fn kill(exe: &str) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/FI", &format!("IMAGENAME eq {exe}"), "/FI", &format!("PID ne {}", std::process::id())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Stops and removes an install from before the rename to Skillster: its processes
+/// (builds from before the CLI/daemon split ran in the background as skills-sync.exe),
+/// its Run entry and its install folder. Its config is left for `install` to carry over.
+pub fn remove_legacy_install() -> Result<(), String> {
+    kill(&format!("{LEGACY_NAME}d.exe"));
+    kill(&format!("{LEGACY_NAME}.exe"));
+    delete_run_entry(LEGACY_NAME)?;
+    let dir = install_dir().with_file_name(LEGACY_NAME);
+    // A just-stopped process may hold its exe for a moment.
+    let mut attempt = 0;
+    while dir.exists() {
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(_) if attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("cannot remove {}: {e}", dir.display())),
+        }
     }
+    Ok(())
 }
 
 /// Registers `daemon` in `HKCU\...\Run` and starts it. Returns where it was registered.
@@ -122,7 +149,11 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
 }
 
 pub fn disable_autostart() -> Result<(), String> {
-    let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), wide(RUN_NAME).as_ptr()) };
+    delete_run_entry(RUN_NAME)
+}
+
+fn delete_run_entry(name: &str) -> Result<(), String> {
+    let err = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), wide(name).as_ptr()) };
     if err == 0 || err == ERROR_FILE_NOT_FOUND {
         Ok(())
     } else {

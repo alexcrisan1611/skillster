@@ -1,13 +1,13 @@
-//! `skills-syncd`: the background process, started at login. No window on Windows;
+//! `skillsterd`: the background process, started at login. No window on Windows;
 //! one instance at a time.
 //!
-//! `skills-syncd [--config <path>]`
+//! `skillsterd [--config <path>]`
 
 #![windows_subsystem = "windows"]
 
 use std::path::PathBuf;
 
-use skills_sync::{config, platform, watch};
+use skillster::{config, platform, watch};
 
 fn main() {
     let mut args = std::env::args().skip(1);

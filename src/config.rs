@@ -42,7 +42,7 @@ impl Default for ConfigFile {
 
 impl Default for LogFile {
     fn default() -> Self {
-        Self { path: contract(&platform::state_dir().join("skills-sync.log")), max_bytes: 1024 * 1024 }
+        Self { path: contract(&platform::state_dir().join("skillster.log")), max_bytes: 1024 * 1024 }
     }
 }
 
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(c.targets, vec![platform::home().join("a")]);
         assert_eq!(c.rescan, Duration::from_secs(60));
         assert_eq!(c.log_max_bytes, 10);
-        assert_eq!(c.log_path, platform::state_dir().join("skills-sync.log"));
+        assert_eq!(c.log_path, platform::state_dir().join("skillster.log"));
     }
 
     #[test]

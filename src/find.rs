@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn walks_without_entering_junk_or_matches() {
-        let root = std::env::temp_dir().join(format!("skills-sync-find-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("skillster-find-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for dir in ["a/skills/one", "a/skills/one/skills", "b/c/skills", "b/node_modules/x/skills", "d"] {
             fs::create_dir_all(at(&root, dir)).unwrap();

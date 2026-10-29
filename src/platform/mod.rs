@@ -13,6 +13,9 @@ pub use unix::*;
 
 use std::fs::{self, File, OpenOptions};
 
+/// The name used before the rename to Skillster.
+pub const LEGACY_NAME: &str = "skills-sync";
+
 /// Holds an exclusive lock on a file in `state_dir()` for the life of the process;
 /// `None` if another instance has it.
 pub fn single_instance() -> Option<File> {
@@ -22,7 +25,7 @@ pub fn single_instance() -> Option<File> {
         .create(true)
         .write(true)
         .truncate(false)
-        .open(dir.join("skills-syncd.lock"))
+        .open(dir.join("skillsterd.lock"))
         .ok()?;
     file.try_lock().ok()?;
     Some(file)

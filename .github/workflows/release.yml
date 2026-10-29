@@ -22,7 +22,7 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
     runs-on: ${{ matrix.os }}
     env:
-      NAME: skills-sync-${{ matrix.target }}
+      NAME: skillster-${{ matrix.target }}
       BIN: target/${{ matrix.target }}/release
     steps:
       - uses: actions/checkout@v7
@@ -35,22 +35,22 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir "$NAME"
-          cp "$BIN/skills-sync" "$BIN/skills-syncd" README.md "$NAME/"
+          cp "$BIN/skillster" "$BIN/skillsterd" README.md "$NAME/"
           tar -czf "$NAME.tar.gz" "$NAME"
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:NAME | Out-Null
-          Copy-Item "$env:BIN/skills-sync.exe", "$env:BIN/skills-syncd.exe", README.md $env:NAME
+          Copy-Item "$env:BIN/skillster.exe", "$env:BIN/skillsterd.exe", README.md $env:NAME
           Compress-Archive $env:NAME "$env:NAME.zip"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
-            skills-sync-*.tar.gz
-            skills-sync-*.zip
+            skillster-*.tar.gz
+            skillster-*.zip
 
   release:
     needs: build

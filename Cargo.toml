@@ -1,10 +1,10 @@
 [package]
-name = "skills-sync"
+name = "skillster"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Keeps one folder of agent skills linked into every skills folder that should have them"
-repository = "https://github.com/alexcrisan1611/skills-sync"
+repository = "https://github.com/alexcrisan1611/skillster"
 readme = "README.md"
 
 [dependencies]
@@ -21,3 +21,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 strip = true
 lto = true
 codegen-units = 1
+
+[build-dependencies]
+embed-resource = "3.0.12"
