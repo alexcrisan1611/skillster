@@ -41,6 +41,17 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// Folders whose subfolders each belong to one app: `~/.config`, plus
+/// `~/Library/Application Support` on macOS and `~/.local/share` elsewhere.
+pub fn app_data_roots() -> Vec<PathBuf> {
+    let data = if cfg!(target_os = "macos") {
+        home().join("Library").join("Application Support")
+    } else {
+        xdg_dir("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local").join("share"))
+    };
+    vec![xdg_config_home(), data]
+}
+
 /// `~/.local/bin`.
 pub fn install_dir() -> PathBuf {
     home().join(".local").join("bin")

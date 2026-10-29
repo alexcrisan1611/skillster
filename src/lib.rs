@@ -10,6 +10,7 @@ pub mod everything;
 pub mod find;
 pub mod install;
 pub mod logger;
+pub mod pick;
 pub mod platform;
 pub mod sync;
 pub mod watch;

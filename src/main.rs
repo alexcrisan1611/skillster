@@ -13,12 +13,11 @@ fn usage() -> String {
         "usage: skills-sync <command> [--config <path>]
 
 commands:
-  install [--es <path>]  choose the folders to sync, then install and start the background process
-                         (--es: Everything's es.exe, Windows only)
-  uninstall              stop it and remove it (keeps the config and existing links)
-  once                   sync once and print what changed
-  config                 show the config file in use and the settings it resolves to
-  version                print the version
+  install    choose the folders to sync, then install and start the background process
+  uninstall  stop it and remove it (keeps the config and existing links)
+  once       sync once and print what changed
+  config     show the config file in use and the settings it resolves to
+  version    print the version
 
 --config defaults to {}",
         config::default_path().display()
@@ -28,13 +27,12 @@ commands:
 fn main() -> ExitCode {
     let mut command = None;
     let mut config_path = None;
-    let mut es = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--config" | "--es" => {
-                let Some(value) = args.next() else { return usage_error(&format!("{arg} needs a value")) };
-                *(if arg == "--config" { &mut config_path } else { &mut es }) = Some(PathBuf::from(value));
+            "--config" => {
+                let Some(value) = args.next() else { return usage_error("--config needs a value") };
+                config_path = Some(PathBuf::from(value));
             }
             "-V" | "--version" | "version" => {
                 println!("skills-sync {}", env!("CARGO_PKG_VERSION"));
@@ -53,7 +51,7 @@ fn main() -> ExitCode {
     let config_path = config_path.unwrap_or_else(config::default_path);
 
     let result = match command.as_deref() {
-        Some("install") => install::install(&config_path, es.as_deref()),
+        Some("install") => install::install(&config_path),
         Some("uninstall") => install::uninstall(&config_path),
         Some("once") => Config::load(&config_path).map(|c| {
             let log = Logger::new(c.log_path.clone(), c.log_max_bytes, true);

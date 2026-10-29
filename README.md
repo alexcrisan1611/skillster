@@ -22,7 +22,9 @@ irm https://github.com/alexcrisan1611/skills-sync/releases/latest/download/insta
 curl -fsSL https://github.com/alexcrisan1611/skills-sync/releases/latest/download/install.sh | sh
 ```
 
-The installer lists the `skills` folders on your computer and asks which one is the source and which are targets (answer with list numbers or paths). On Windows it searches with [Everything](https://www.voidtools.com/) if Everything is running and its command-line tool is installed (`winget install voidtools.Everything.Cli`; or pass `--es <path to es.exe>`). Otherwise, and on Linux and macOS, it searches your home folder.
+The installer finds the `skills` folders on your computer and lets you pick, with arrow keys, the source and (with space) the targets; folders that already link to the source come ticked, and you can type other paths. On Windows it asks [Everything](https://www.voidtools.com/) (1.4 or 1.5) if it is running, which takes a moment; otherwise, and on Linux and macOS, it searches your home folder.
+
+Only folders worth syncing are offered: a tool's own skills folder (`~/.claude/skills`, `~/.gemini/antigravity/skills`, `%APPDATA%\<app>\skills`, `~/.config/<app>/skills`) and standalone collections that hold skills (`~/Projects/my-skills/skills`). Plugin and marketplace caches, editor extensions, packages, virtualenvs, temp folders, backups, worktrees and projects' own `.claude/skills` are left out.
 
 It then writes the config, installs `skills-sync` and `skills-syncd`, and starts `skills-syncd` now and at every login:
 
@@ -55,7 +57,7 @@ Dropping a target, or changing the source, leaves the links already made in plac
 ## Commands
 
 ```
-skills-sync install [--es <path>]   choose folders, install, start
+skills-sync install                 choose folders, install, start
 skills-sync uninstall               stop and remove (keeps the config and existing links)
 skills-sync once                    sync once and print what changed
 skills-sync config                  show the config in use and what it resolves to
@@ -84,6 +86,7 @@ Pushing a `v*` tag builds every platform and publishes a GitHub release (`.githu
 | `src/watch.rs` | The background loop: file watching, rescans, config reload |
 | `src/install.rs` | `install` / `uninstall` |
 | `src/find.rs` | Finding `skills` folders for the installer |
-| `src/everything.rs` | Asking Everything's `es.exe` (Windows) |
+| `src/everything.rs` | Asking a running Everything over its IPC (Windows) |
+| `src/pick.rs` | The folder menus |
 | `src/logger.rs` | The log file |
 | `src/platform/` | What differs per OS: links, folders, path syntax, autostart |

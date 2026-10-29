@@ -35,6 +35,12 @@ pub fn state_dir() -> PathBuf {
     local_appdata().join("skills-sync")
 }
 
+/// Folders whose subfolders each belong to one app: `%APPDATA%`, `%LOCALAPPDATA%`, and
+/// `~/.config`, which many cross-platform tools use on Windows too.
+pub fn app_data_roots() -> Vec<PathBuf> {
+    vec![config_dir().parent().map(Path::to_path_buf).unwrap_or_default(), local_appdata(), home().join(".config")]
+}
+
 /// `%LOCALAPPDATA%\Programs\skills-sync`.
 pub fn install_dir() -> PathBuf {
     local_appdata().join("Programs").join("skills-sync")
