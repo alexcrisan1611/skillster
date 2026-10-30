@@ -9,6 +9,7 @@ use super::LEGACY_NAME;
 
 pub const CLI_EXE: &str = "skillster";
 pub const DAEMON_EXE: &str = "skillsterd";
+pub const UI_EXE: &str = "skillster-ui";
 
 #[cfg(target_os = "macos")]
 const LAUNCHD_LABEL: &str = "io.github.alexcrisan1611.skillster";
@@ -136,6 +137,11 @@ pub fn stop_daemon() {
     quiet(Command::new("pkill").args(["-x", DAEMON_EXE]));
 }
 
+/// Closes the window, so its binary can be replaced or removed.
+pub fn stop_ui() {
+    quiet(Command::new("pkill").args(["-x", UI_EXE]));
+}
+
 /// Registers `daemon` to start at login and starts it. Returns where it was registered.
 #[cfg(target_os = "macos")]
 pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, String> {
@@ -249,10 +255,11 @@ fn remove_autostart(daemon: &str) -> Result<(), String> {
     remove_if_exists(&autostart_entry_path(daemon))
 }
 
-/// Deletes the two binaries from `dir` (`~/.local/bin` holds other programs too).
+/// Deletes the binaries from `dir` (`~/.local/bin` holds other programs too).
 pub fn remove_binaries(dir: &Path) -> Result<(), String> {
     remove_if_exists(&dir.join(CLI_EXE))?;
-    remove_if_exists(&dir.join(DAEMON_EXE))
+    remove_if_exists(&dir.join(DAEMON_EXE))?;
+    remove_if_exists(&dir.join(UI_EXE))
 }
 
 /// Stops and removes an install from before the rename to Skillster: its login
@@ -297,6 +304,103 @@ fn systemd_unit_path(unit: &str) -> PathBuf {
 #[cfg(not(target_os = "macos"))]
 fn autostart_entry_path(daemon: &str) -> PathBuf {
     xdg_config_home().join("autostart").join(format!("{daemon}.desktop"))
+}
+
+/// Starts `daemon` in the background, without registering it.
+pub fn start_daemon(daemon: &Path, config: Option<&Path>) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let mut start = Command::new(daemon);
+    if let Some(c) = config {
+        start.arg("--config").arg(c);
+    }
+    start
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("cannot start {}: {e}", daemon.display()))
+}
+
+/// Shows a folder in the file manager, or opens a file in its usual app.
+pub fn open(p: &Path) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = Command::new(opener).arg(p).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
+/// Not asked of the system here; the window's animations are short either way.
+pub fn reduced_motion() -> bool {
+    false
+}
+
+/// `~/Applications/Skillster.app`, holding a copy of the window's binary.
+#[cfg(target_os = "macos")]
+fn app_bundle() -> PathBuf {
+    home().join("Applications").join("Skillster.app")
+}
+
+/// Adds Skillster to `~/Applications`. Returns where.
+#[cfg(target_os = "macos")]
+pub fn add_app_entry(ui: &Path) -> Result<String, String> {
+    let contents = app_bundle().join("Contents");
+    let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \x20   <key>CFBundleName</key>\n    <string>Skillster</string>\n\
+         \x20   <key>CFBundleIdentifier</key>\n    <string>io.github.alexcrisan1611.skillster.ui</string>\n\
+         \x20   <key>CFBundleExecutable</key>\n    <string>skillster-ui</string>\n\
+         \x20   <key>CFBundlePackageType</key>\n    <string>APPL</string>\n\
+         \x20   <key>NSHighResolutionCapable</key>\n    <true/>\n\
+         </dict>\n</plist>\n";
+    write_file(&contents.join("Info.plist"), plist)?;
+    let exe = contents.join("MacOS").join(UI_EXE);
+    fs::create_dir_all(contents.join("MacOS")).map_err(|e| format!("cannot create {}: {e}", contents.display()))?;
+    fs::copy(ui, &exe).map_err(|e| format!("cannot copy to {}: {e}", exe.display()))?;
+    Ok(app_bundle().display().to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_app_entry() -> Result<(), String> {
+    match fs::remove_dir_all(app_bundle()) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!("cannot remove {}: {e}", app_bundle().display())),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn icon_path() -> PathBuf {
+    data_home().join("icons").join("hicolor").join("256x256").join("apps").join("skillster.png")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn data_home() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local").join("share"))
+}
+
+/// Adds a desktop entry, with the icon, so Skillster shows among the applications.
+/// Returns where.
+#[cfg(not(target_os = "macos"))]
+pub fn add_app_entry(ui: &Path) -> Result<String, String> {
+    let icon = icon_path();
+    if let Some(dir) = icon.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    fs::write(&icon, super::ICON_PNG).map_err(|e| format!("cannot write {}: {e}", icon.display()))?;
+    let entry = data_home().join("applications").join("skillster.desktop");
+    let text = format!(
+        "[Desktop Entry]\nType=Application\nName=Skillster\nComment=Keep your agent skills folders in sync\n\
+         Exec={}\nIcon=skillster\nTerminal=false\nCategories=Utility;\n",
+        quote_exec(&ui.to_string_lossy())
+    );
+    write_file(&entry, &text)?;
+    Ok(entry.display().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn remove_app_entry() -> Result<(), String> {
+    remove_if_exists(&data_home().join("applications").join("skillster.desktop"))?;
+    remove_if_exists(&icon_path())
 }
 
 /// One argument of a systemd `ExecStart=` or desktop-entry `Exec=` line.

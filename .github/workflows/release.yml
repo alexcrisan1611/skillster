@@ -29,20 +29,30 @@ jobs:
       - run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
       - if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - if: "!contains(matrix.target, 'linux-musl')"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # Static musl binaries cannot load the system's graphics libraries, so on Linux
+      # the command line and the background process are musl and the window is glibc.
+      - if: contains(matrix.target, 'linux-musl')
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --no-default-features
+          GNU="${{ matrix.target }}"; GNU="${GNU/musl/gnu}"
+          rustup target add "$GNU"
+          cargo build --release --locked --target "$GNU" --bin skillster-ui
+          cp "target/$GNU/release/skillster-ui" "$BIN/"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir "$NAME"
-          cp "$BIN/skillster" "$BIN/skillsterd" README.md "$NAME/"
+          cp "$BIN/skillster" "$BIN/skillsterd" "$BIN/skillster-ui" README.md "$NAME/"
           tar -czf "$NAME.tar.gz" "$NAME"
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:NAME | Out-Null
-          Copy-Item "$env:BIN/skillster.exe", "$env:BIN/skillsterd.exe", README.md $env:NAME
+          Copy-Item "$env:BIN/skillster.exe", "$env:BIN/skillsterd.exe", "$env:BIN/skillster-ui.exe", README.md $env:NAME
           Compress-Archive $env:NAME "$env:NAME.zip"
 
       - uses: actions/upload-artifact@v7

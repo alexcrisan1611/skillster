@@ -1,21 +1,39 @@
 [package]
 name = "skillster"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Keeps one folder of agent skills linked into every skills folder that should have them"
 repository = "https://github.com/alexcrisan1611/skillster"
 readme = "README.md"
 
+[[bin]]
+name = "skillster-ui"
+path = "src/bin/skillster-ui/main.rs"
+required-features = ["ui"]
+
+[features]
+default = ["ui"]
+# The window (`skillster-ui`). Off for the static Linux builds, which cannot load
+# the system's graphics libraries; their window is built separately.
+ui = ["dep:eframe", "dep:winit"]
+
 [dependencies]
 dialoguer = { version = "0.12.0", default-features = false }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "wayland", "x11"] }
 notify = "8.2.1"
 serde = { version = "1.0.229", features = ["derive"] }
+similar = "2.7"
 toml = "1.1.8"
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.1.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
+raw-window-handle = "0.6"
+
+# Loads the Wayland libraries when the window opens, rather than needing them to build.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+winit = { version = "0.30", optional = true, default-features = false, features = ["wayland-dlopen"] }
 
 [profile.release]
 strip = true

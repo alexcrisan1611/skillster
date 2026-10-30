@@ -10,12 +10,12 @@ use std::time::Duration;
 use crate::config::{self, ConfigFile, LogFile};
 use crate::{find, pick};
 use crate::logger::Logger;
-use crate::platform::{self, CLI_EXE, DAEMON_EXE, LEGACY_NAME, normalize};
+use crate::platform::{self, CLI_EXE, DAEMON_EXE, LEGACY_NAME, UI_EXE, normalize};
 use crate::sync::sync;
 
-/// Asks for the folders, writes the config, copies both binaries into
-/// `platform::install_dir()`, registers the background process to start at login,
-/// and starts it. An install from before the rename to Skillster is replaced, its
+/// Asks for the folders, writes the config, copies the binaries into
+/// `platform::install_dir()`, adds the window to the system's applications,
+/// registers the background process to start at login, and starts it. An install from before the rename to Skillster is replaced, its
 /// config carried over.
 pub fn install(config_path: &Path) -> Result<(), String> {
     let here = std::env::current_exe().map_err(|e| format!("cannot locate this program: {e}"))?;
@@ -32,10 +32,19 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 
     let dir = platform::install_dir();
     platform::stop_daemon();
+    platform::stop_ui();
     platform::remove_legacy_install()?;
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     copy_retrying(&here, &dir.join(CLI_EXE))?;
     copy_retrying(&daemon_src, &dir.join(DAEMON_EXE))?;
+    // Builds without the window (the static Linux ones) ship without it.
+    let ui_src = here.with_file_name(UI_EXE);
+    let app_entry = if ui_src.is_file() {
+        copy_retrying(&ui_src, &dir.join(UI_EXE))?;
+        Some(platform::add_app_entry(&dir.join(UI_EXE))?)
+    } else {
+        None
+    };
 
     println!("\nSyncing now:");
     sync(&config, &Logger::new(config.log_path.clone(), config.log_max_bytes, true), &mut HashSet::new());
@@ -44,6 +53,9 @@ pub fn install(config_path: &Path) -> Result<(), String> {
     let autostart = platform::enable_autostart(&dir.join(DAEMON_EXE), custom_config)?;
 
     println!("\nInstalled to {}. It runs in the background and starts at login ({autostart}).", dir.display());
+    if let Some(entry) = app_entry {
+        println!("Open Skillster from your applications ({entry}) to see and fix what isn't linked.");
+    }
     println!("Edit {} to change folders; changes apply straight away.", config_path.display());
     println!("Log: {}", config.log_path.display());
     let on_path = std::env::var_os("PATH")
@@ -58,7 +70,9 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 /// The config and the links already made are left in place.
 pub fn uninstall(config_path: &Path) -> Result<(), String> {
     platform::stop_daemon();
+    platform::stop_ui();
     platform::disable_autostart()?;
+    platform::remove_app_entry()?;
     let dir = platform::install_dir();
     platform::remove_binaries(&dir)?;
     println!("Uninstalled from {}.", dir.display());

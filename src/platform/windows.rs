@@ -12,6 +12,7 @@ use super::LEGACY_NAME;
 
 pub const CLI_EXE: &str = "skillster.exe";
 pub const DAEMON_EXE: &str = "skillsterd.exe";
+pub const UI_EXE: &str = "skillster-ui.exe";
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "skillster";
@@ -53,15 +54,24 @@ pub fn create_link(src: &Path, dest: &Path) -> io::Result<()> {
     junction::create(src, dest)
 }
 
-/// Where the junction at `p` points, including broken ones (`junction::exists` is
-/// false when the target is gone); `None` if `p` is not a junction.
+/// Where the junction or symbolic link at `p` points, including broken ones
+/// (`junction::exists` is false when the target is gone); `None` if `p` is neither.
+/// Other tools make symbolic links, so both count.
 pub fn link_target(p: &Path) -> Option<PathBuf> {
-    junction::get_target(p).ok()
+    if let Ok(t) = junction::get_target(p) {
+        return Some(t);
+    }
+    if !fs::symlink_metadata(p).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let t = fs::read_link(p).ok()?;
+    Some(if t.is_absolute() { t } else { p.parent()?.join(t) })
 }
 
-/// `remove_dir` on a junction deletes the link only, never what it points to.
+/// Deletes the link only, never what it points to: `remove_dir` for a junction or a
+/// folder's symbolic link, `remove_file` for a file's.
 pub fn remove_link(p: &Path) -> io::Result<()> {
-    fs::remove_dir(p)
+    fs::remove_dir(p).or_else(|_| fs::remove_file(p))
 }
 
 /// Comparable form of a path: no `\\?\` / `\??\` prefix, no trailing slash, lowercase.
@@ -96,6 +106,11 @@ pub fn native_path(s: &str) -> PathBuf {
 /// Stops the background process.
 pub fn stop_daemon() {
     kill(DAEMON_EXE);
+}
+
+/// Closes the window, so its binary can be replaced or removed.
+pub fn stop_ui() {
+    kill(UI_EXE);
 }
 
 /// Stops every process running `exe`, sparing this one.
@@ -146,6 +161,63 @@ pub fn enable_autostart(daemon: &Path, config: Option<&Path>) -> Result<String, 
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", daemon.display()))?;
     Ok(format!(r"HKCU\{RUN_KEY}\{RUN_NAME}"))
+}
+
+/// Starts `daemon` in the background, without registering it.
+pub fn start_daemon(daemon: &Path, config: Option<&Path>) -> Result<(), String> {
+    let mut start = Command::new(daemon);
+    if let Some(c) = config {
+        start.arg("--config").arg(c);
+    }
+    start
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("cannot start {}: {e}", daemon.display()))
+}
+
+/// Shows a folder in Explorer, or opens a file in its usual app.
+pub fn open(p: &Path) {
+    let _ = Command::new("explorer").arg(p).spawn();
+}
+
+/// Whether Windows is set to show fewer animations ("Animation effects" off).
+pub fn reduced_motion() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW};
+    let mut on: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL to the pointer given.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut on).cast(), 0) };
+    ok != 0 && on == 0
+}
+
+fn start_menu_shortcut() -> PathBuf {
+    config_dir().with_file_name("Microsoft").join(r"Windows\Start Menu\Programs\Skillster.lnk")
+}
+
+/// Adds a Start Menu shortcut to the window. Returns where.
+pub fn add_app_entry(ui: &Path) -> Result<String, String> {
+    let link = start_menu_shortcut();
+    let quote = |p: &Path| p.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath = '{}'; $s.Save()",
+        quote(&link),
+        quote(ui)
+    );
+    let ok = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok { Ok(format!("Start Menu ({})", link.display())) } else { Err(format!("cannot create {}", link.display())) }
+}
+
+pub fn remove_app_entry() -> Result<(), String> {
+    match fs::remove_file(start_menu_shortcut()) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!("cannot remove the Start Menu shortcut: {e}")),
+        _ => Ok(()),
+    }
 }
 
 pub fn disable_autostart() -> Result<(), String> {
