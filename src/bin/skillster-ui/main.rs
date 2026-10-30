@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod skills_sh;
 mod theme;
 mod watch;
 mod window;

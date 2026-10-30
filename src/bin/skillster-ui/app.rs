@@ -1,10 +1,13 @@
 //! The window's contents: skills missing from the source, then what needs fixing
-//! in each folder, then the folders that are fine as one line each.
+//! in each folder, then the folders that are fine as one line each. Searching
+//! lists the skills in the source instead, to look at or delete, and the ones
+//! on skills.sh, to look at or install.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use eframe::egui::collapsing_header::CollapsingState;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Id, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
     UiBuilder, Vec2, emath::easing,
@@ -13,6 +16,7 @@ use skillster::config::{self, Config, contract};
 use skillster::platform::{self, DAEMON_EXE, normalize};
 use skillster::status::{self, Kind, Problem, Report};
 
+use crate::skills_sh::{self, Hit, Reply, Request};
 use crate::theme::{self, colours};
 use crate::watch::{Scan, Scanner};
 use crate::window;
@@ -27,6 +31,12 @@ const NOTICE_IN: f32 = 0.18;
 const NOTICE_OUT: f32 = 0.13;
 /// Most diff lines shown per file.
 const DIFF_LINES: usize = 300;
+/// How long a Delete waits for its second click.
+const CONFIRM: Duration = Duration::from_secs(4);
+/// Long enough for a deleted skill's row to close.
+const LEAVING: Duration = Duration::from_millis(600);
+/// How long the typing pauses before skills.sh is asked.
+const ASK_AFTER: Duration = Duration::from_millis(300);
 
 pub struct App {
     config_path: PathBuf,
@@ -40,6 +50,31 @@ pub struct App {
     /// Diffs shown so far, by key and file; cleared whenever anything changes.
     diffs: HashMap<(String, String), Option<String>>,
     notice: Option<Notice>,
+    /// The search box; while it isn't empty the list shows matching skills.
+    query: String,
+    /// Each source skill's `SKILL.md`, read when first needed; cleared whenever
+    /// anything changes.
+    texts: HashMap<String, Option<String>>,
+    /// The skill whose Delete was clicked once, and when.
+    confirm: Option<(String, Instant)>,
+    /// Skills just deleted, shown closing until the scan no longer has them.
+    leaving: Vec<(String, Instant)>,
+    skills_sh: skills_sh::Client,
+    remote: Remote,
+}
+
+/// The search on skills.sh.
+struct Remote {
+    /// When the search box last changed.
+    typed: Instant,
+    /// The last search asked for.
+    asked: String,
+    /// The last answer, and the search it answers.
+    found: Option<(String, Result<Vec<Hit>, String>)>,
+    /// Skills' files, fetched to view, by id.
+    files: HashMap<String, Result<Vec<skills_sh::File>, String>>,
+    /// Ids of the skills being installed.
+    installing: HashSet<String>,
 }
 
 struct Notice {
@@ -53,6 +88,11 @@ enum Action {
     Toggle(String),
     StartDaemon,
     Open(PathBuf),
+    /// Asks before deleting: the first click arms it, the second deletes.
+    Delete(String),
+    /// Shows or hides a skill on skills.sh, fetching it the first time.
+    ViewRemote(Hit),
+    Install(Hit),
 }
 
 /// Identifies a problem across scans.
@@ -81,6 +121,18 @@ impl App {
             open: HashSet::new(),
             diffs: HashMap::new(),
             notice: None,
+            query: String::new(),
+            texts: HashMap::new(),
+            confirm: None,
+            leaving: Vec::new(),
+            skills_sh: skills_sh::Client::spawn(cc.egui_ctx.clone()),
+            remote: Remote {
+                typed: Instant::now(),
+                asked: String::new(),
+                found: None,
+                files: HashMap::new(),
+                installing: HashSet::new(),
+            },
         }
     }
 
@@ -88,8 +140,29 @@ impl App {
         while let Ok(scan) = self.scanner.scans.try_recv() {
             if self.scan.as_ref().is_none_or(|s| s.report != scan.report) {
                 self.diffs.clear();
+                let leaving = &self.leaving;
+                self.texts.retain(|k, _| leaving.iter().any(|(n, _)| n == k));
             }
             self.scan = Some(scan);
+        }
+    }
+
+    fn take_replies(&mut self) {
+        while let Ok(reply) = self.skills_sh.replies.try_recv() {
+            match reply {
+                Reply::Found { query, hits } => self.remote.found = Some((query, hits)),
+                Reply::Fetched { id, files } => {
+                    self.remote.files.insert(id, files);
+                }
+                Reply::Installed { id, result } => {
+                    self.remote.installing.remove(&id);
+                    match result {
+                        Ok(msg) => self.notify(msg, false),
+                        Err(e) => self.notify(e, true),
+                    }
+                    self.scanner.refresh();
+                }
+            }
         }
     }
 
@@ -105,6 +178,39 @@ impl App {
                 }
             }
             Action::Open(p) => platform::open(&p),
+            Action::ViewRemote(hit) => {
+                let k = remote_key(&hit.id);
+                if !self.open.remove(&k) {
+                    self.open.insert(k);
+                    // Fetched once; a failed fetch is tried again.
+                    if !matches!(self.remote.files.get(&hit.id), Some(Ok(_))) {
+                        self.remote.files.remove(&hit.id);
+                        self.skills_sh.send(Request::Fetch(hit));
+                    }
+                }
+            }
+            Action::Install(hit) => {
+                let Some(Ok(config)) = self.scan.as_ref().map(|s| &s.config) else { return };
+                self.remote.installing.insert(hit.id.clone());
+                self.skills_sh.send(Request::Install(hit, config.source.clone()));
+            }
+            Action::Delete(skill) => {
+                if self.confirm.as_ref().is_none_or(|(s, at)| *s != skill || at.elapsed() > CONFIRM) {
+                    self.confirm = Some((skill, Instant::now()));
+                    return;
+                }
+                self.confirm = None;
+                let Some(Ok(config)) = self.scan.as_ref().map(|s| s.config.clone()) else { return };
+                match status::remove(&config, &skill, &platform::backups_dir()) {
+                    Ok(msg) => {
+                        self.open.remove(&view_key(&skill));
+                        self.leaving.push((skill, Instant::now()));
+                        self.notify(msg, false);
+                    }
+                    Err(e) => self.notify(e, true),
+                }
+                self.scanner.refresh();
+            }
             Action::StartDaemon => match self.start_daemon() {
                 Ok(()) => self.notify("Started background sync".into(), false),
                 Err(e) => self.notify(e, true),
@@ -179,12 +285,19 @@ impl App {
         }
         let mut action = summary(ui, config, &scan.report, scan.daemon_running);
         ui.add_space(14.0);
+        self.search_box(ui, scan.report.skills.len());
+        ui.add_space(10.0);
         let list_height = (ui.available_height() - FOOTER).max(60.0);
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), list_height), Layout::top_down(Align::Min), |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // Room for the scroll bar.
                 ui.set_width(ui.available_width() - 10.0);
-                if let Some(a) = self.list(ui, config, &scan.report) {
+                let found = if self.query.trim().is_empty() {
+                    self.list(ui, config, &scan.report)
+                } else {
+                    self.results(ui, config, &scan.report)
+                };
+                if let Some(a) = found {
                     action = Some(a);
                 }
             });
@@ -204,6 +317,310 @@ impl App {
             }
             ui.label(RichText::new("Skillster").font(theme::strong(15.0)).color(colours().text));
         });
+    }
+
+    /// Ctrl+F (Cmd+F on macOS) focuses it, Escape clears it.
+    fn search_box(&mut self, ui: &mut egui::Ui, count: usize) {
+        let id = Id::unique("search");
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.query)
+                .id(id)
+                .hint_text(format!("Search {count} skills"))
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(10, 7)),
+        );
+        if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.query.clear();
+        }
+        if response.changed() {
+            self.remote.typed = Instant::now();
+        }
+    }
+
+    /// The source's skills whose name or description has every word searched for.
+    /// Every skill keeps a row: one that stops matching, or is deleted, closes,
+    /// and one that matches again opens, so the list settles instead of jumping.
+    fn results(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
+        let c = colours();
+        self.leaving.retain(|(n, at)| report.skills.contains(n) || at.elapsed() < LEAVING);
+        if !self.leaving.is_empty() {
+            ui.ctx().request_repaint_after(LEAVING);
+        }
+        let mut names: Vec<String> = report.skills.clone();
+        names.extend(self.leaving.iter().map(|(n, _)| n.clone()));
+        names.sort();
+        names.dedup();
+        let terms: Vec<String> = self.query.to_lowercase().split_whitespace().map(String::from).collect();
+        let mut rows = Vec::new();
+        for name in names {
+            let text = self.texts.entry(name.clone()).or_insert_with(|| status::skill_text(&config.source.join(&name)));
+            let desc = text.as_deref().and_then(status::description);
+            let hay = format!("{name} {}", desc.as_deref().unwrap_or_default()).to_lowercase();
+            let leaving = self.leaving.iter().any(|(n, _)| *n == name);
+            let matches = !leaving && terms.iter().all(|t| hay.contains(t.as_str()));
+            rows.push((name, desc, matches));
+        }
+        let shown = rows.iter().filter(|r| r.2).count();
+        group_heading(
+            ui,
+            &format!("Skills in {}", contract(&config.source)),
+            &format!("{shown} of {}", report.skills.len()),
+        );
+        if shown == 0 {
+            ui.add_space(6.0);
+            let text = format!("No skill matches \u{201c}{}\u{201d}.", self.query.trim());
+            ui.label(RichText::new(text).color(c.text_weak));
+        }
+        let mut action = None;
+        for (name, desc, matches) in rows {
+            if let Some(a) = self.result(ui, config, &name, desc.as_deref(), matches) {
+                action = Some(a);
+            }
+        }
+        ui.add_space(14.0);
+        if let Some(a) = self.remote_results(ui, config, report) {
+            action = Some(a);
+        }
+        action
+    }
+
+    /// The same search on skills.sh, asked once the typing pauses. Each answer
+    /// replaces the last, its rows opening in.
+    fn remote_results(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
+        let c = colours();
+        let query = self.query.trim().to_string();
+        let found = self.remote.found.as_ref().filter(|(q, _)| *q == query).map(|(_, hits)| hits.clone());
+        let count = match &found {
+            Some(Ok(hits)) => format!("{} found", hits.len()),
+            _ => String::new(),
+        };
+        group_heading(ui, "On skills.sh", &count);
+        ui.add_space(4.0);
+        let weak = |ui: &mut egui::Ui, text: &str| {
+            ui.label(RichText::new(text).color(c.text_weak));
+        };
+        if query.chars().count() < 2 {
+            weak(ui, "Type two letters or more to search skills.sh.");
+            return None;
+        }
+        if query != self.remote.asked {
+            let wait = ASK_AFTER.saturating_sub(self.remote.typed.elapsed());
+            if wait.is_zero() {
+                self.skills_sh.send(Request::Search(query.clone()));
+                self.remote.asked = query;
+            } else {
+                ui.ctx().request_repaint_after(wait);
+            }
+        }
+        let mut action = None;
+        match found {
+            None => weak(ui, "Searching skills.sh\u{2026}"),
+            Some(Err(e)) => {
+                ui.label(RichText::new(format!("Couldn't reach skills.sh: {e}")).color(c.error));
+            }
+            Some(Ok(hits)) if hits.is_empty() => weak(ui, "Nothing on skills.sh matches."),
+            Some(Ok(hits)) => {
+                for hit in &hits {
+                    let installed = report.skills.contains(&hit.skill_id);
+                    // New to this answer: opens in. Kept from the last: stays put.
+                    let id = Id::unique(("remote-row", &hit.id));
+                    let mut row = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                    row.set_open(true);
+                    let openness = row.openness(ui.ctx());
+                    row.show_body_unindented(ui, |ui| {
+                        ui.set_opacity(openness);
+                        if let Some(a) = self.remote_result(ui, config, hit, installed) {
+                            action = Some(a);
+                        }
+                    });
+                }
+            }
+        }
+        action
+    }
+
+    /// A skill on skills.sh: where it comes from and how often it is installed,
+    /// View and Install, and when viewed its `SKILL.md`.
+    fn remote_result(&mut self, ui: &mut egui::Ui, config: &Config, hit: &Hit, installed: bool) -> Option<Action> {
+        let c = colours();
+        let k = remote_key(&hit.id);
+        let viewing = self.open.contains(&k);
+        let installing = self.remote.installing.contains(&hit.id);
+        let mut action = None;
+        let backdrop = ui.painter().add(Shape::Noop);
+        let response = ui
+            .horizontal(|ui| {
+                ui.set_min_height(42.0);
+                ui.add_space(8.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    if installed {
+                        ui.add_enabled(false, egui::Button::new("Installed"));
+                    } else if installing {
+                        ui.add_enabled(false, egui::Button::new("Installing\u{2026}"));
+                    } else if ui
+                        .button("Install")
+                        .on_hover_text(format!("Download it into {} and link it into every tool", contract(&config.source)))
+                        .clicked()
+                    {
+                        action = Some(Action::Install(hit.clone()));
+                    }
+                    if ui.button(if viewing { "Hide" } else { "View" }).clicked() {
+                        action = Some(Action::ViewRemote(hit.clone()));
+                    }
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(RichText::new(&hit.name).color(c.text));
+                        let from = format!("{} \u{b7} {} installs", hit.source, skills_sh::count(hit.installs));
+                        ui.add(egui::Label::new(RichText::new(from).small().color(c.text_weak)).truncate());
+                    });
+                });
+            })
+            .response;
+        self.backdrop(ui, backdrop, response.rect, &k, viewing);
+        let mut view = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("remote-view", &hit.id)), false);
+        view.set_open(viewing);
+        let opened = view.openness(ui.ctx());
+        view.show_body_unindented(ui, |ui| {
+            ui.set_opacity(opened);
+            ui.add_space(4.0);
+            panel().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match self.remote.files.get(&hit.id) {
+                    None => {
+                        ui.label(RichText::new("Fetching it from skills.sh\u{2026}").color(c.text_weak));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(format!("Couldn't fetch it: {e}")).color(c.error));
+                    }
+                    Some(Ok(files)) => {
+                        let text = skills_sh::skill_md(files).unwrap_or("It has no SKILL.md.");
+                        egui::ScrollArea::vertical().id_salt(("remote-view", &hit.id)).max_height(260.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(text).monospace().color(c.text)).wrap());
+                        });
+                        if files.len() > 1 {
+                            ui.add_space(6.0);
+                            let more = format!("And {} more files.", files.len() - 1);
+                            ui.label(RichText::new(more).small().color(c.text_weak));
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+                if ui.button("Open on skills.sh").clicked() {
+                    action = Some(Action::Open(PathBuf::from(hit.page())));
+                }
+            });
+            ui.add_space(8.0);
+        });
+        action
+    }
+
+    /// A row's wash, while hovered or open.
+    fn backdrop(&self, ui: &egui::Ui, at: egui::layers::ShapeIdx, rect: Rect, key: &str, open: bool) {
+        let hovered = ui.rect_contains_pointer(rect);
+        let t = ui.ctx().animate_bool_with_time(Id::unique(("row-hover", key)), hovered || open, 0.1);
+        if t > 0.0 {
+            let fill = colours().wash.gamma_multiply(t * if self.light { 1.0 } else { 3.0 });
+            ui.painter().set(at, Shape::rect_filled(rect, CornerRadius::same(8), fill));
+        }
+    }
+
+    /// One skill: its name and description, View and Delete, and when viewed its
+    /// `SKILL.md`. The row opens and closes as `shown` changes, and the view as it
+    /// is toggled, over the theme's `animation_time` with a cubic ease-out
+    /// (instantly with reduced motion).
+    fn result(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &Config,
+        name: &str,
+        desc: Option<&str>,
+        shown: bool,
+    ) -> Option<Action> {
+        let mut action = None;
+        let mut row = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("result", name)), true);
+        row.set_open(shown);
+        let openness = row.openness(ui.ctx());
+        row.show_body_unindented(ui, |ui| {
+            ui.set_opacity(openness);
+            let c = colours();
+            let k = view_key(name);
+            let viewing = self.open.contains(&k);
+            let confirming = self.confirm.as_ref().is_some_and(|(s, at)| s == name && at.elapsed() < CONFIRM);
+            if confirming {
+                ui.ctx().request_repaint_after(CONFIRM);
+            }
+            let backdrop = ui.painter().add(Shape::Noop);
+            let response = ui
+                .horizontal(|ui| {
+                    ui.set_min_height(42.0);
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(6.0);
+                        let delete = if confirming {
+                            ui.button(RichText::new("Confirm delete").color(c.error))
+                        } else {
+                            ui.button("Delete")
+                        };
+                        if delete.on_hover_text("Moves it to backups and removes its link from every tool").clicked() {
+                            action = Some(Action::Delete(name.to_string()));
+                        }
+                        if ui.button(if viewing { "Hide" } else { "View" }).clicked() {
+                            action = Some(Action::Toggle(k.clone()));
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.add_space(4.0);
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(RichText::new(name).color(c.text));
+                            if let Some(d) = desc {
+                                ui.add(egui::Label::new(RichText::new(d).small().color(c.text_weak)).truncate());
+                            }
+                        });
+                    });
+                })
+                .response;
+            self.backdrop(ui, backdrop, response.rect, &k, viewing);
+            let mut view = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("view", name)), false);
+            view.set_open(viewing);
+            let opened = view.openness(ui.ctx());
+            view.show_body_unindented(ui, |ui| {
+                ui.set_opacity(opened);
+                ui.add_space(4.0);
+                if let Some(a) = self.quick_view(ui, config, name) {
+                    action = Some(a);
+                }
+                ui.add_space(8.0);
+            });
+        });
+        action
+    }
+
+    /// A skill's `SKILL.md`, and a way to its folder.
+    fn quick_view(&mut self, ui: &mut egui::Ui, config: &Config, name: &str) -> Option<Action> {
+        let c = colours();
+        let mut action = None;
+        panel().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match self.texts.get(name).and_then(Option::as_deref) {
+                Some(text) => {
+                    egui::ScrollArea::vertical().id_salt(("view", name)).max_height(260.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(text).monospace().color(c.text)).wrap());
+                    });
+                }
+                None => {
+                    ui.label(RichText::new("This skill has no readable SKILL.md.").color(c.text_weak));
+                }
+            }
+            ui.add_space(10.0);
+            if ui.button("Open folder").clicked() {
+                action = Some(Action::Open(config.source.join(name)));
+            }
+        });
+        action
     }
 
     fn list(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
@@ -464,7 +881,7 @@ fn summary(ui: &mut egui::Ui, config: &Config, report: &Report, daemon: bool) ->
         }
     });
 
-    let safe: Vec<Problem> = report.problems.iter().filter(|p| p.kind.safe()).cloned().collect();
+    let (safe, edited): (Vec<Problem>, Vec<Problem>) = report.problems.iter().cloned().partition(|p| p.kind.safe());
     if !safe.is_empty() {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -472,13 +889,28 @@ fn summary(ui: &mut egui::Ui, config: &Config, report: &Report, daemon: bool) ->
             if primary_button(ui, &label).clicked() {
                 action = Some(Action::Fix(safe.clone()));
             }
-            let edited = n - safe.len();
-            let note = if edited == 0 {
+            let note = if edited.is_empty() {
                 "Copies are moved to backups first.".to_string()
             } else {
-                format!("Leaves the {} for you to review.", plural(edited, "edited copy", "edited copies"))
+                format!("Leaves the {} for you to review.", plural(edited.len(), "edited copy", "edited copies"))
             };
             ui.label(RichText::new(note).small().color(c.text_weak));
+        });
+    }
+    if !edited.is_empty() {
+        ui.add_space(if safe.is_empty() { 10.0 } else { 6.0 });
+        ui.horizontal(|ui| {
+            let label = format!("Replace {} with links", plural(edited.len(), "edited copy", "edited copies"));
+            // The main action once nothing safe is left.
+            let response = if safe.is_empty() {
+                primary_button(ui, &label)
+            } else {
+                ui.add(egui::Button::new(RichText::new(label).font(theme::strong(13.0))).min_size(Vec2::new(0.0, 30.0)))
+            };
+            if response.on_hover_text("Each copy is moved to backups first, so its edits are kept there").clicked() {
+                action = Some(Action::Fix(edited.clone()));
+            }
+            ui.label(RichText::new("Their edits are kept in backups.").small().color(c.text_weak));
         });
     }
     action
@@ -493,6 +925,23 @@ fn group_heading(ui: &mut egui::Ui, title: &str, count: &str) {
         });
     });
     ui.add_space(2.0);
+}
+
+fn view_key(skill: &str) -> String {
+    format!("view|{skill}")
+}
+
+fn remote_key(id: &str) -> String {
+    format!("remote|{id}")
+}
+
+/// The inset panel a row opens into.
+fn panel() -> egui::Frame {
+    egui::Frame::new()
+        .fill(colours().code)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .outer_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
 }
 
 fn is_unshared(p: &Problem) -> bool {
@@ -611,6 +1060,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.take_scans();
+        self.take_replies();
         // The system's theme can change while we run.
         let light = ctx.system_theme() == Some(egui::Theme::Light);
         if light != self.light {

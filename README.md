@@ -16,7 +16,9 @@ The Skillster window shows what the background process had to leave alone, folde
 - **An edited copy**: lists the files that differ, with a diff of each, so you can decide. Replacing it is one click.
 - **Not in the source**: a skill some target folders have but the source doesn't, often one an installer copied into each tool. The copy most folders agree on (by SHA-256) moves into the source and is linked from there, so every tool gets it; identical copies become links, and different ones are left as edited copies to review.
 
-Copies are never deleted: they are moved into a `backups` folder next to the log first. **Fix safely** does everything except the edited copies in one go. The window also says whether background sync is running, and can start it.
+Copies are never deleted: they are moved into a `backups` folder next to the log first. **Fix safely** does everything except the edited copies in one go, and **Replace edited copies with links** does those too.
+
+The search box (Ctrl+F) finds your skills by name or description, to read one's `SKILL.md` or delete it (it goes to `backups`, and its links go from every tool). It searches [skills.sh](https://skills.sh) at the same time: **Install** puts a skill from there into the source, and every tool gets it. The window also says whether background sync is running, and can start it.
 
 <p align="center"><img src="assets/screenshot.png" width="640" alt="The Skillster window listing links to fix"></p>
 

@@ -319,6 +319,50 @@ fn link(src: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// A skill's `SKILL.md`, or `None` when there is none or it is not reasonably
+/// sized text.
+pub fn skill_text(dir: &Path) -> Option<String> {
+    let p = dir.join("SKILL.md");
+    if fs::metadata(&p).ok()?.len() > 256 * 1024 {
+        return None;
+    }
+    fs::read_to_string(p).ok()
+}
+
+/// The `description` from a `SKILL.md`'s front matter, folded onto one line.
+pub fn description(skill_md: &str) -> Option<String> {
+    let mut lines = skill_md.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let front: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
+    let at = front.iter().position(|l| l.starts_with("description:"))?;
+    let value = front[at]["description:".len()..].trim();
+    let text = if value.is_empty() || value.starts_with('>') || value.starts_with('|') {
+        // A block: the indented lines that follow.
+        let block: Vec<&str> =
+            front[at + 1..].iter().take_while(|l| l.starts_with([' ', '\t'])).map(|l| l.trim()).collect();
+        block.join(" ")
+    } else {
+        value.trim_matches(|c| c == '"' || c == '\'').to_string()
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// Removes a skill from the source, so every tool loses it: moves it into
+/// `backup` (keeping it) and removes the links to it.
+pub fn remove(config: &Config, skill: &str, backup: &Path) -> Result<String, String> {
+    let src = config.source.join(skill);
+    let to = back_up(backup, &config.source, skill)?;
+    for target in &config.targets {
+        let dest = target.join(skill);
+        if link_target(&dest).is_some_and(|t| normalize(&t) == normalize(&src)) {
+            remove_link(&dest).map_err(|e| format!("cannot remove the link {}: {e}", dest.display()))?;
+        }
+    }
+    Ok(format!("Deleted {skill}; it is in {}", to.display()))
+}
+
 /// `<backup>/<unix seconds>/<target, as one folder name>/<skill>`, so nothing
 /// backed up is ever overwritten.
 fn backup_path(backup: &Path, target: &Path, skill: &str) -> PathBuf {
@@ -447,6 +491,43 @@ mod tests {
         assert!(left.iter().all(|(_, k)| matches!(k, Kind::Differs(_) | Kind::Missing)), "{left:?}");
         assert!(files(&backup).unwrap().len() == 2, "the identical copies are kept");
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reads_descriptions() {
+        assert_eq!(description("---
+name: a
+description: \"Does a thing.\"
+---
+# A").as_deref(), Some("Does a thing."));
+        assert_eq!(description("---
+description: >
+  Folded
+  text.
+name: a
+---").as_deref(), Some("Folded text."));
+        assert_eq!(description("# No front matter"), None);
+    }
+
+    #[test]
+    fn removes_a_skill_and_its_links() {
+        let root = std::env::temp_dir().join(format!("skillster-remove-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (source, t, backup) = (root.join("source"), root.join("t"), root.join("backup"));
+        fs::create_dir_all(source.join("gone")).unwrap();
+        fs::write(source.join("gone").join("SKILL.md"), "x").unwrap();
+        fs::create_dir_all(&t).unwrap();
+        create_link(&source.join("gone"), &t.join("gone")).unwrap();
+        let file = ConfigFile {
+            source: source.to_string_lossy().into_owned(),
+            targets: vec![t.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        remove(&file.resolve().unwrap(), "gone", &backup).unwrap();
+        assert!(fs::symlink_metadata(source.join("gone")).is_err());
+        assert!(fs::symlink_metadata(t.join("gone")).is_err());
+        assert!(files(&backup).unwrap().keys().any(|k| k.ends_with("/gone/SKILL.md")));
         fs::remove_dir_all(&root).unwrap();
     }
 
