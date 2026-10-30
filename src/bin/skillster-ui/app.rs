@@ -1,19 +1,19 @@
-//! The window's contents: what needs fixing first, then the folders that are
-//! fine as one line each.
+//! The window's contents: skills missing from the source, then what needs fixing
+//! in each folder, then the folders that are fine as one line each.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Id, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
-    TextureHandle, UiBuilder, Vec2, emath::easing,
+    self, Align, Align2, Color32, CornerRadius, Id, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
+    UiBuilder, Vec2, emath::easing,
 };
 use skillster::config::{self, Config, contract};
 use skillster::platform::{self, DAEMON_EXE, normalize};
 use skillster::status::{self, Kind, Problem, Report};
 
-use crate::theme::{self, RADIUS, colours};
+use crate::theme::{self, colours};
 use crate::watch::{Scan, Scanner};
 use crate::window;
 
@@ -123,15 +123,19 @@ impl App {
                         Err(e) => failed.push(e),
                     }
                 }
-                let backed_up = problems.iter().any(|p| matches!(p.kind, Kind::Same | Kind::Differs(_)));
+                let backed_up = problems.iter().any(|p| match &p.kind {
+                    Kind::Same | Kind::Differs(_) => true,
+                    Kind::Unshared { same, .. } => !same.is_empty(),
+                    _ => false,
+                });
                 match (done.len(), failed.first()) {
                     (_, Some(e)) => self.notify(e.clone(), true),
-                    (1, None) => self.notify(done.remove(0), false),
+                    (1, None) if !backed_up => self.notify(done.remove(0), false),
                     (n, None) => self.notify(
                         if backed_up {
-                            format!("Fixed {n} links; the copies are in {}", contract(&backups))
+                            format!("Made {n} fixes; the copies are in {}", contract(&backups))
                         } else {
-                            format!("Fixed {n} links")
+                            format!("Made {n} fixes")
                         },
                         false,
                     ),
@@ -206,12 +210,28 @@ impl App {
         let c = colours();
         let mut action = None;
         let total = report.skills.len();
+        let unshared: Vec<&Problem> = report.problems.iter().filter(|p| is_unshared(p)).collect();
+        if !unshared.is_empty() {
+            let n = unshared.len();
+            group_heading(
+                ui,
+                &format!("Not in {}", contract(&config.source)),
+                &format!("{n} {}", if n == 1 { "skill" } else { "skills" }),
+            );
+            for p in unshared {
+                if let Some(a) = self.row(ui, config, p) {
+                    action = Some(a);
+                }
+            }
+            ui.add_space(14.0);
+        }
         for target in &report.targets {
-            let problems: Vec<&Problem> = report.problems.iter().filter(|p| p.target == target.path).collect();
+            let problems: Vec<&Problem> =
+                report.problems.iter().filter(|p| p.target == target.path && !is_unshared(p)).collect();
             if problems.is_empty() {
                 continue;
             }
-            group_heading(ui, &target.path, target.linked, total);
+            group_heading(ui, &contract(&target.path), &format!("{} of {total}", target.linked));
             for p in problems {
                 if let Some(a) = self.row(ui, config, p) {
                     action = Some(a);
@@ -219,7 +239,11 @@ impl App {
             }
             ui.add_space(14.0);
         }
-        let fine: Vec<_> = report.targets.iter().filter(|t| t.linked == total).collect();
+        let fine: Vec<_> = report
+            .targets
+            .iter()
+            .filter(|t| t.linked == total && !report.problems.iter().any(|p| involves(p, &t.path)))
+            .collect();
         if !fine.is_empty() {
             if !report.problems.is_empty() {
                 ui.label(RichText::new("In sync").font(theme::strong(12.5)).color(c.text_weak));
@@ -253,7 +277,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(RichText::new(&p.skill).color(c.text));
-                    let (text, colour) = describe(&p.kind);
+                    let (text, colour) = describe(p);
                     ui.label(RichText::new(text).small().color(colour));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -264,6 +288,13 @@ impl App {
                             ui.button("Replace").on_hover_text("Move the copy to backups and link the source").clicked()
                         }
                         Kind::Elsewhere(_) => ui.button("Relink").on_hover_text("Point the link at the source").clicked(),
+                        Kind::Unshared { .. } => ui
+                            .button("Move to source")
+                            .on_hover_text(format!(
+                                "Move the copy in {} into the source and link it there; identical copies go to backups",
+                                contract(&p.target)
+                            ))
+                            .clicked(),
                         Kind::Differs(_) => {
                             if ui.button(if open { "Hide" } else { "Review" }).clicked() {
                                 action = Some(Action::Toggle(k.clone()));
@@ -398,15 +429,17 @@ fn summary(ui: &mut egui::Ui, config: &Config, report: &Report, daemon: bool) ->
     let c = colours();
     let mut action = None;
     let n = report.problems.len();
-    let headline = match n {
-        0 => "Every tool is up to date".to_string(),
-        1 => "1 link to fix".to_string(),
-        n => format!("{n} links to fix"),
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let unshared = report.problems.iter().filter(|p| is_unshared(p)).count();
+    let headline = match (n - unshared, unshared) {
+        (0, 0) => "Every tool is up to date".to_string(),
+        (l, 0) => format!("{} to fix", plural(l, "link", "links")),
+        (0, u) => format!("{} not in the source", plural(u, "skill", "skills")),
+        (l, u) => format!("{} to fix, {} not in the source", plural(l, "link", "links"), plural(u, "skill", "skills")),
     };
     ui.label(RichText::new(headline).heading().color(c.text_strong));
     let links = report.links();
     let total = report.skills.len() * report.targets.len();
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     ui.label(
         RichText::new(format!(
             "{} from {} into {}. {links} of {total} in place.",
@@ -451,24 +484,45 @@ fn summary(ui: &mut egui::Ui, config: &Config, report: &Report, daemon: bool) ->
     action
 }
 
-fn group_heading(ui: &mut egui::Ui, target: &Path, linked: usize, total: usize) {
+fn group_heading(ui: &mut egui::Ui, title: &str, count: &str) {
     let c = colours();
     ui.horizontal(|ui| {
-        ui.label(RichText::new(contract(target)).font(theme::strong(12.5)).color(c.text_weak));
+        ui.label(RichText::new(title).font(theme::strong(12.5)).color(c.text_weak));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{linked} of {total}")).small().color(c.text_weak));
+            ui.label(RichText::new(count).small().color(c.text_weak));
         });
     });
     ui.add_space(2.0);
 }
 
-fn describe(kind: &Kind) -> (String, Color32) {
+fn is_unshared(p: &Problem) -> bool {
+    matches!(p.kind, Kind::Unshared { .. })
+}
+
+/// Whether fixing `p` touches the target folder `target`.
+fn involves(p: &Problem, target: &Path) -> bool {
+    p.target == target
+        || matches!(&p.kind, Kind::Unshared { same, differ } if same.iter().chain(differ).any(|t| t == target))
+}
+
+fn describe(p: &Problem) -> (String, Color32) {
     let c = colours();
-    match kind {
+    match &p.kind {
         Kind::Missing => ("Not linked yet".into(), c.text_weak),
         Kind::Same => ("A copy, identical to the source".into(), c.text_weak),
         Kind::Elsewhere(t) if !t.exists() => (format!("Links to {}, which is gone", contract(t)), c.warn),
         Kind::Elsewhere(t) => (format!("Links to {}", contract(t)), c.warn),
+        Kind::Unshared { same, differ } => {
+            let mut text = match same.len() {
+                0 => format!("Only in {}", contract(&p.target)),
+                n => format!("In {} identical copies", n + 1),
+            };
+            if !differ.is_empty() {
+                let n = differ.len();
+                text += &format!("; {n} different {} to review after", if n == 1 { "copy" } else { "copies" });
+            }
+            (text, if differ.is_empty() { c.text_weak } else { c.warn })
+        }
         Kind::Differs(d) if *d == status::Diff::default() => ("A copy that couldn't be read".into(), c.warn),
         Kind::Differs(d) => {
             let mut parts = Vec::new();
@@ -551,7 +605,7 @@ fn check(ui: &mut egui::Ui, colour: Color32) {
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent where the window's rounded corners are painted.
-        if window::PAINT_CORNERS { [0.0; 4] } else { colours().window.to_normalized_gamma_f32() }
+        if window::PAINT_CORNERS { [0.0; 4] } else { colours().card.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -565,10 +619,9 @@ impl eframe::App for App {
         }
         let c = colours();
         let window = ui.max_rect();
-        ui.painter().rect_filled(window, window::window_radius(&ctx), c.window);
-        let mut card = window.shrink(theme::GAP);
-        card.min.y = window.top() + window::top_gap();
-        ui.painter().rect(card, CornerRadius::same(RADIUS), c.card, Stroke::new(1.0, c.card_stroke), StrokeKind::Inside);
+        ui.painter().rect_filled(window, window::window_radius(&ctx), c.card);
+        let mut card = window;
+        card.min.y += window::top_gap();
         let inner = Rect::from_min_max(card.min + PAD, card.max - PAD);
         let action = ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| self.content(ui)).inner;
         window::frame_controls(ui, window, card);

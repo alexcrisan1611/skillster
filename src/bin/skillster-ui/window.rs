@@ -14,9 +14,9 @@ pub const NATIVE_BUTTONS: bool = cfg!(target_os = "macos");
 /// Whether the window is transparent, so we paint its rounded corners.
 pub const PAINT_CORNERS: bool = cfg!(all(unix, not(target_os = "macos")));
 
-/// Above the canvas: room for macOS's traffic lights, else the usual gap.
+/// Above the canvas: room for macOS's traffic lights.
 pub fn top_gap() -> f32 {
-    if NATIVE_BUTTONS { 30.0 } else { theme::GAP }
+    if NATIVE_BUTTONS { 22.0 } else { 0.0 }
 }
 
 pub fn builder(viewport: ViewportBuilder) -> ViewportBuilder {

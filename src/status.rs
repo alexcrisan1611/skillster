@@ -1,11 +1,17 @@
 //! What each target folder holds for each skill right now, and putting it right:
-//! the window's view of the same work `sync` does in the background.
+//! the window's view of the same work `sync` does in the background, plus the
+//! skills some targets have that the source does not.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::hash::{DefaultHasher, Hash as _, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::platform::{create_link, link_target, normalize, remove_link};
@@ -29,6 +35,14 @@ pub enum Kind {
     Differs(Diff),
     /// A link to somewhere other than the source (possibly to nothing).
     Elsewhere(PathBuf),
+    /// A folder in some targets that the source lacks. The problem's target holds
+    /// the copy that moves into the source: the one most copies match.
+    Unshared {
+        /// Other targets with an identical copy, linked once it has moved.
+        same: Vec<PathBuf>,
+        /// Targets with a different copy, left to review against the source after.
+        differ: Vec<PathBuf>,
+    },
 }
 
 impl Kind {
@@ -101,7 +115,83 @@ pub fn scan(config: &Config) -> Report {
         }
         report.targets.push(Target { path: target.clone(), linked });
     }
+    report.problems.extend(unshared(config, &report.skills));
     report
+}
+
+/// Skill folders that targets hold and the source lacks, one problem per skill.
+/// Copies match when their SHA-256 over every file's path and bytes does. Links
+/// are left alone, as `sync` leaves them.
+fn unshared(config: &Config, skills: &[String]) -> Vec<Problem> {
+    type Hash = Option<[u8; 32]>;
+    let mut copies: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for target in &config.targets {
+        let Ok(entries) = fs::read_dir(target) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name.starts_with('.') || skills.contains(&name) || link_target(&path).is_some() || !path.is_dir() {
+                continue;
+            }
+            copies.entry(name).or_default().push(target.clone());
+        }
+    }
+    let mut problems = Vec::new();
+    for (skill, copies) in copies {
+        let mut groups: Vec<(Hash, Vec<PathBuf>)> = Vec::new();
+        let alone = copies.len() == 1;
+        for target in copies {
+            // A copy with nothing to match needs no reading.
+            let hash = if alone { Some([0; 32]) } else { digest(&target.join(&skill)).ok() };
+            match groups.iter_mut().find(|g| hash.is_some() && g.0 == hash) {
+                Some(g) => g.1.push(target),
+                None => groups.push((hash, vec![target])),
+            }
+        }
+        // The most copies win; a tie goes to the target listed first. A copy that
+        // can't be read never moves.
+        groups.sort_by_key(|g| (g.0.is_none(), Reverse(g.1.len())));
+        if groups[0].0.is_none() {
+            continue;
+        }
+        let mut same = groups.remove(0).1;
+        let target = same.remove(0);
+        let differ = groups.into_iter().flat_map(|g| g.1).collect();
+        problems.push(Problem { skill, target, kind: Kind::Unshared { same, differ } });
+    }
+    problems
+}
+
+/// Digests by folder, with a stamp of every file's size and modification time:
+/// the window rescans every few seconds, and reads again only what changed.
+static DIGESTS: LazyLock<Mutex<HashMap<PathBuf, Stamped>>> = LazyLock::new(Mutex::default);
+type Stamped = (u64, [u8; 32]);
+
+fn digest(root: &Path) -> io::Result<[u8; 32]> {
+    let files = files(root)?;
+    let mut stamp = DefaultHasher::new();
+    for (rel, path) in &files {
+        let meta = fs::metadata(path)?;
+        (rel, meta.len(), meta.modified().ok()).hash(&mut stamp);
+    }
+    let stamp = stamp.finish();
+    let mut cache = DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((s, d)) = cache.get(root)
+        && *s == stamp
+    {
+        return Ok(*d);
+    }
+    let mut hash = Sha256::new();
+    for (rel, path) in files {
+        let bytes = fs::read(path)?;
+        hash.update((rel.len() as u64).to_le_bytes());
+        hash.update(rel.as_bytes());
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+    }
+    let d: [u8; 32] = hash.finalize().into();
+    cache.insert(root.to_path_buf(), (stamp, d));
+    Ok(d)
 }
 
 /// Skill folders in the source, as `sync` sees them.
@@ -176,8 +266,8 @@ pub fn file_diff(source: &Path, copy: &Path, rel: &str) -> Option<String> {
 }
 
 /// Makes `problem.target` get the skill from the source: moves a copy into
-/// `backup` (keeping it), replaces a link to elsewhere, then links. Returns what
-/// was done, for the user.
+/// `backup` (keeping it), replaces a link to elsewhere, then links. A skill the
+/// source lacks is moved into it first. Returns what was done, for the user.
 pub fn fix(source: &Path, problem: &Problem, backup: &Path) -> Result<String, String> {
     let src = source.join(&problem.skill);
     let dest = problem.target.join(&problem.skill);
@@ -189,19 +279,43 @@ pub fn fix(source: &Path, problem: &Problem, backup: &Path) -> Result<String, St
             format!("Relinked {}", problem.skill)
         }
         Kind::Same | Kind::Differs(_) => {
-            let to = backup_path(backup, &problem.target, &problem.skill);
-            if let Some(dir) = to.parent() {
-                fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-            }
-            fs::rename(&dest, &to).map_err(|e| format!("cannot move {shown} to {}: {e}", to.display()))?;
+            let to = back_up(backup, &problem.target, &problem.skill)?;
             format!("Replaced {} with a link; the copy is in {}", problem.skill, to.display())
         }
+        Kind::Unshared { same, .. } => {
+            if fs::symlink_metadata(&src).is_ok() {
+                return Err(format!("{} is already in the source", problem.skill));
+            }
+            fs::rename(&dest, &src).map_err(|e| format!("cannot move {shown} to {}: {e}", src.display()))?;
+            link(&src, &dest)?;
+            for target in same {
+                back_up(backup, target, &problem.skill)?;
+                link(&src, &target.join(&problem.skill))?;
+            }
+            return Ok(format!("Moved {} into the source", problem.skill));
+        }
     };
-    match create_link(&src, &dest) {
-        Ok(()) => Ok(done),
+    link(&src, &dest)?;
+    Ok(done)
+}
+
+/// Moves `target`'s copy of `skill` into `backup`, returning where it went.
+fn back_up(backup: &Path, target: &Path, skill: &str) -> Result<PathBuf, String> {
+    let from = target.join(skill);
+    let to = backup_path(backup, target, skill);
+    if let Some(dir) = to.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    fs::rename(&from, &to).map_err(|e| format!("cannot move {} to {}: {e}", from.display(), to.display()))?;
+    Ok(to)
+}
+
+fn link(src: &Path, dest: &Path) -> Result<(), String> {
+    match create_link(src, dest) {
+        Ok(()) => Ok(()),
         // The background process may have linked it in the meantime.
-        Err(_) if link_target(&dest).is_some_and(|t| normalize(&t) == normalize(&src)) => Ok(done),
-        Err(e) => Err(format!("cannot link {shown}: {e}")),
+        Err(_) if link_target(dest).is_some_and(|t| normalize(&t) == normalize(src)) => Ok(()),
+        Err(e) => Err(format!("cannot link {}: {e}", dest.display())),
     }
 }
 
@@ -282,6 +396,56 @@ mod tests {
         let kept: Vec<_> = files(&backup).unwrap().into_keys().collect();
         assert!(kept.iter().any(|k| k.ends_with("/edited/extra.md")), "{kept:?}");
         assert!(kept.iter().any(|k| k.ends_with("/same/SKILL.md")), "{kept:?}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn moves_the_most_shared_copy_into_the_source() {
+        let root = std::env::temp_dir().join(format!("skillster-unshared-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (source, backup) = (root.join("source"), root.join("backup"));
+        let targets: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|t| root.join(t)).collect();
+        fs::create_dir_all(&source).unwrap();
+        let skill = |target: &Path, name: &str, text: &str| {
+            fs::create_dir_all(target.join(name)).unwrap();
+            fs::write(target.join(name).join("SKILL.md"), text).unwrap();
+        };
+        // "shared": a's copy is edited, b, c and d agree. "lone": only in d.
+        skill(&targets[0], "shared", "mine");
+        for t in &targets[1..] {
+            skill(t, "shared", "theirs");
+        }
+        skill(&targets[3], "lone", "x");
+        create_link(&targets[3].join("lone"), &targets[2].join("elsewhere")).unwrap();
+
+        let file = ConfigFile {
+            source: source.to_string_lossy().into_owned(),
+            targets: targets.iter().map(|t| t.to_string_lossy().into_owned()).collect(),
+            ..Default::default()
+        };
+        let config = file.resolve().unwrap();
+        let report = scan(&config);
+        let shared = report.problems.iter().find(|p| p.skill == "shared").unwrap();
+        assert_eq!(normalize(&shared.target), normalize(&targets[1]));
+        let Kind::Unshared { same, differ } = &shared.kind else { panic!("{:?}", shared.kind) };
+        assert_eq!(same.len(), 2);
+        assert_eq!(differ.len(), 1);
+        assert!(report.problems.iter().any(|p| p.skill == "lone"));
+        assert!(!report.problems.iter().any(|p| p.skill == "elsewhere"), "links are left alone");
+
+        for p in &report.problems {
+            fix(&source, p, &backup).unwrap();
+        }
+        assert_eq!(fs::read_to_string(source.join("shared").join("SKILL.md")).unwrap(), "theirs");
+        assert!(source.join("lone").is_dir());
+        let after = scan(&config);
+        let left: Vec<_> = after.problems.iter().map(|p| (p.skill.as_str(), p.kind.clone())).collect();
+        // The edited copy is now just an edited copy of the source; the rest is
+        // missing links the background process makes.
+        assert!(left.iter().any(|(s, k)| *s == "shared" && matches!(k, Kind::Differs(_))), "{left:?}");
+        assert!(left.iter().all(|(_, k)| matches!(k, Kind::Differs(_) | Kind::Missing)), "{left:?}");
+        assert!(files(&backup).unwrap().len() == 2, "the identical copies are kept");
 
         fs::remove_dir_all(&root).unwrap();
     }

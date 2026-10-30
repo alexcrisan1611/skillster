@@ -1,4 +1,4 @@
-//! The look, after Fracst's: bundled fonts, a rounded card over a darker window,
+//! The look, after Fracst's: bundled fonts, one card filling the window,
 //! Dark or Light as the system is, and the icon's indigo as the accent.
 
 use std::sync::Arc;
@@ -6,14 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Shadow, Stroke, TextStyle};
 
-/// Corner radius of the window and the card inside it.
+/// Corner radius of the window and of floating cards.
 pub const RADIUS: u8 = 12;
-/// Gap between the window's edge and the card.
-pub const GAP: f32 = 8.0;
 
 pub struct Colours {
-    /// Behind the card.
-    pub window: Color32,
     pub card: Color32,
     pub card_stroke: Color32,
     pub text: Color32,
@@ -43,7 +39,6 @@ const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
 }
 
 const DARK: Colours = Colours {
-    window: Color32::from_rgb(11, 11, 14),
     card: Color32::from_rgb(19, 19, 24),
     card_stroke: rgba(56, 56, 64, 140),
     text: Color32::from_rgb(226, 226, 232),
@@ -64,7 +59,6 @@ const DARK: Colours = Colours {
 };
 
 const LIGHT: Colours = Colours {
-    window: Color32::from_rgb(228, 228, 234),
     card: Color32::from_rgb(252, 252, 254),
     card_stroke: Color32::from_black_alpha(34),
     text: Color32::from_rgb(28, 28, 34),
@@ -153,7 +147,7 @@ fn visuals(light: bool) -> egui::Visuals {
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
     let r = CornerRadius::same(7);
     let shadow = |a: f32| Color32::from_black_alpha((a * c.shadow) as u8);
-    v.panel_fill = c.window;
+    v.panel_fill = c.card;
     v.window_fill = c.card;
     v.window_stroke = Stroke::new(1.0, c.card_stroke);
     v.window_corner_radius = CornerRadius::same(RADIUS);

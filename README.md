@@ -14,6 +14,7 @@ The Skillster window shows what the background process had to leave alone, folde
 - **A copy, identical to the source**: replaces it with a link.
 - **Links elsewhere** (often to a folder another tool has since deleted): points it at the source.
 - **An edited copy**: lists the files that differ, with a diff of each, so you can decide. Replacing it is one click.
+- **Not in the source**: a skill some target folders have but the source doesn't, often one an installer copied into each tool. The copy most folders agree on (by SHA-256) moves into the source and is linked from there, so every tool gets it; identical copies become links, and different ones are left as edited copies to review.
 
 Copies are never deleted: they are moved into a `backups` folder next to the log first. **Fix safely** does everything except the edited copies in one go. The window also says whether background sync is running, and can start it.
 
