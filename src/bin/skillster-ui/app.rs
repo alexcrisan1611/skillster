@@ -325,18 +325,28 @@ impl App {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(id));
         }
+        let clearable = !self.query.is_empty();
+        let right = if clearable { 38 } else { 10 };
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
                 .id(id)
                 .hint_text(format!("Search {count} skills"))
                 .desired_width(f32::INFINITY)
-                .margin(egui::Margin::symmetric(10, 7)),
+                .margin(egui::Margin { left: 10, right, top: 7, bottom: 7 }),
         );
         if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.query.clear();
         }
         if response.changed() {
             self.remote.typed = Instant::now();
+        }
+        if clearable {
+            let centre = Pos2::new(response.rect.right() - 19.0, response.rect.center().y);
+            if clear_button(ui, centre).clicked() {
+                self.query.clear();
+                self.remote.typed = Instant::now();
+                ui.memory_mut(|m| m.request_focus(id));
+            }
         }
     }
 
@@ -1049,6 +1059,27 @@ fn check(ui: &mut egui::Ui, colour: Color32) {
     let stroke = Stroke::new(1.6, colour);
     ui.painter().line_segment([p(3.0, 7.5), p(6.0, 10.5)], stroke);
     ui.painter().line_segment([p(6.0, 10.5), p(11.5, 4.0)], stroke);
+}
+
+/// The round button that clears the search, drawn over the field's right end:
+/// a dark disc with a faint rim and a thin cross, brighter when hovered.
+fn clear_button(ui: &mut egui::Ui, centre: Pos2) -> egui::Response {
+    let c = colours();
+    let rect = Rect::from_center_size(centre, Vec2::splat(24.0));
+    let response = ui
+        .interact(rect, Id::unique("search-clear"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Clear the search (Esc)");
+    let hovered = response.hovered() || response.has_focus();
+    let (fill, _) = if hovered { c.button_hovered } else { c.button };
+    let rim = if hovered { c.text_weak.gamma_multiply(0.5) } else { c.card_stroke };
+    let painter = ui.painter();
+    painter.circle(centre, 11.0, fill, Stroke::new(1.0, rim));
+    let s = 3.75;
+    let stroke = Stroke::new(1.4, if hovered { c.text_strong } else { c.text });
+    painter.line_segment([centre + Vec2::new(-s, -s), centre + Vec2::new(s, s)], stroke);
+    painter.line_segment([centre + Vec2::new(-s, s), centre + Vec2::new(s, -s)], stroke);
+    response
 }
 
 impl eframe::App for App {
