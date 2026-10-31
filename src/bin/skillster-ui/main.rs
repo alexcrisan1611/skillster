@@ -7,6 +7,7 @@
 
 mod app;
 mod skills_sh;
+mod sources;
 mod theme;
 mod watch;
 mod window;

@@ -142,7 +142,10 @@ fn run(ctx: &egui::Context, rx: &Receiver<Request>, tx: &Sender<Reply>) {
                 Request::Search(query) => Reply::Found { hits: search(&agent, &query), query },
                 Request::Fetch(hit) => Reply::Fetched { files: download(&agent, &hit), id: hit.id },
                 Request::Install(hit, source) => Reply::Installed {
-                    result: download(&agent, &hit).and_then(|files| install(&source, &hit.skill_id, &files)),
+                    result: download(&agent, &hit).and_then(|files| install(&source, &hit.skill_id, &files)).inspect(|_| {
+                        // Installed either way; without the record it shows no source.
+                        let _ = crate::sources::record(&hit.skill_id, &hit.source);
+                    }),
                     id: hit.id,
                 },
             };

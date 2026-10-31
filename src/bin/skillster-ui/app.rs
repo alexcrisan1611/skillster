@@ -17,6 +17,7 @@ use skillster::platform::{self, DAEMON_EXE, normalize};
 use skillster::status::{self, Kind, Problem, Report};
 
 use crate::skills_sh::{self, Hit, Reply, Request};
+use crate::sources;
 use crate::theme::{self, colours};
 use crate::watch::{Scan, Scanner};
 use crate::window;
@@ -40,6 +41,8 @@ const DIALOG_IN: f32 = 0.18;
 const DIALOG_OUT: f32 = 0.12;
 /// How tall the fades over the dialog's text are.
 const FADE: f32 = 36.0;
+/// The source shown for a skill neither the `skills` CLI nor Skillster installed.
+const UNKNOWN: &str = "unknown";
 
 pub struct App {
     config_path: PathBuf,
@@ -68,6 +71,11 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Whether the dialog is open, rather than closing.
     dialog_open: bool,
+    /// Each source skill's source, by name; read again with every scan.
+    sources: HashMap<String, String>,
+    /// The source the results are narrowed to; while set, the list shows the
+    /// skills from it even with nothing typed.
+    filter: Option<String>,
 }
 
 /// A skill to read in the dialog.
@@ -121,6 +129,8 @@ enum Action {
     Install(Hit),
     /// Searches skills.sh.
     Search(String),
+    /// Narrows the results to one source, or shows every source again.
+    Filter(Option<String>),
 }
 
 /// Identifies a problem across scans.
@@ -162,6 +172,8 @@ impl App {
             },
             dialog: None,
             dialog_open: false,
+            sources: sources::read(),
+            filter: None,
         }
     }
 
@@ -173,7 +185,13 @@ impl App {
                 self.texts.retain(|k, _| leaving.iter().any(|(n, _)| n == k));
             }
             self.scan = Some(scan);
+            self.sources = sources::read();
         }
+    }
+
+    /// Where the source skill `name` came from.
+    fn source_of(&self, name: &str) -> &str {
+        self.sources.get(name).map_or(UNKNOWN, String::as_str)
     }
 
     fn take_replies(&mut self) {
@@ -217,6 +235,7 @@ impl App {
                 }
             }
             Action::Open(p) => platform::open(&p),
+            Action::Filter(source) => self.filter = source,
             Action::View(name) => self.open_dialog(Dialog::Local(name)),
             Action::Search(query) => {
                 self.remote.found = None;
@@ -245,6 +264,7 @@ impl App {
                 let Some(Ok(config)) = self.scan.as_ref().map(|s| s.config.clone()) else { return };
                 match status::remove(&config, &skill, &platform::backups_dir()) {
                     Ok(msg) => {
+                        let _ = sources::forget(&skill);
                         if matches!(&self.dialog, Some(Dialog::Local(n)) if *n == skill) {
                             self.dialog_open = false;
                         }
@@ -338,7 +358,7 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // Room for the scroll bar.
                 ui.set_width(ui.available_width() - 10.0);
-                let found = if self.query.trim().is_empty() {
+                let found = if self.query.trim().is_empty() && self.filter.is_none() {
                     self.list(ui, config, &scan.report)
                 } else {
                     self.results(ui, config, &scan.report)
@@ -372,17 +392,22 @@ impl App {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(id));
         }
-        let clearable = !self.query.is_empty();
+        let clearable = !self.query.is_empty() || self.filter.is_some();
         let right = if clearable { 38 } else { 10 };
+        let hint = match &self.filter {
+            Some(f) => format!("Search the skills from {f}"),
+            None => format!("Search {count} skills"),
+        };
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
                 .id(id)
-                .hint_text(format!("Search {count} skills"))
+                .hint_text(hint)
                 .desired_width(f32::INFINITY)
                 .margin(egui::Margin { left: 10, right, top: 7, bottom: 7 }),
         );
         if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.query.clear();
+            self.filter = None;
         }
         let query = self.query.trim();
         let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -390,17 +415,19 @@ impl App {
         if clearable {
             let centre = Pos2::new(response.rect.right() - 19.0, response.rect.center().y);
             let rect = Rect::from_center_size(centre, Vec2::splat(24.0));
-            if close_button(ui, rect, "search-clear", "Clear the search (Esc)").clicked() {
+            if close_button(ui, rect, "search-clear", "Clear the search and the source (Esc)").clicked() {
                 self.query.clear();
+                self.filter = None;
                 ui.memory_mut(|m| m.request_focus(id));
             }
         }
         search
     }
 
-    /// The source's skills whose name or description has every word searched for.
-    /// Every skill keeps a row: one that stops matching, or is deleted, closes,
-    /// and one that matches again opens, so the list settles instead of jumping.
+    /// The source's skills whose name or description has every word searched for,
+    /// from the source picked above them, if one is. Every skill keeps a row: one
+    /// that stops matching, or is deleted, closes, and one that matches again
+    /// opens, so the list settles instead of jumping.
     fn results(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
         let c = colours();
         self.leaving.retain(|(n, at)| report.skills.contains(n) || at.elapsed() < LEAVING);
@@ -413,28 +440,40 @@ impl App {
         names.dedup();
         let terms: Vec<String> = self.query.to_lowercase().split_whitespace().map(String::from).collect();
         let mut rows = Vec::new();
+        // How many of the skills the words match come from each source.
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for name in names {
             let text = self.texts.entry(name.clone()).or_insert_with(|| status::skill_text(&config.source.join(&name)));
             let desc = text.as_deref().and_then(status::description);
             let hay = format!("{name} {}", desc.as_deref().unwrap_or_default()).to_lowercase();
             let leaving = self.leaving.iter().any(|(n, _)| *n == name);
-            let matches = !leaving && terms.iter().all(|t| hay.contains(t.as_str()));
-            rows.push((name, desc, matches));
+            let source = self.source_of(&name).to_string();
+            let words = !leaving && terms.iter().all(|t| hay.contains(t.as_str()));
+            if words {
+                *counts.entry(source.clone()).or_default() += 1;
+            }
+            let matches = words && self.filter.as_ref().is_none_or(|f| *f == source);
+            rows.push((name, desc, source, matches));
         }
-        let shown = rows.iter().filter(|r| r.2).count();
+        let shown = rows.iter().filter(|r| r.3).count();
         group_heading(
             ui,
             &format!("Skills in {}", contract(&config.source)),
             &format!("{shown} of {}", report.skills.len()),
         );
+        let mut action = self.source_filter(ui, &counts);
         if shown == 0 {
             ui.add_space(6.0);
-            let text = format!("No skill matches \u{201c}{}\u{201d}.", self.query.trim());
+            let query = self.query.trim();
+            let text = match (&self.filter, query.is_empty()) {
+                (Some(f), true) => format!("No skill comes from {f}."),
+                (Some(f), false) => format!("No skill from {f} matches \u{201c}{query}\u{201d}."),
+                (None, _) => format!("No skill matches \u{201c}{query}\u{201d}."),
+            };
             ui.label(RichText::new(text).color(c.text_weak));
         }
-        let mut action = None;
-        for (name, desc, matches) in rows {
-            if let Some(a) = self.result(ui, &name, desc.as_deref(), matches) {
+        for (name, desc, source, matches) in rows {
+            if let Some(a) = self.result(ui, &name, desc.as_deref(), &source, matches) {
                 action = Some(a);
             }
         }
@@ -445,14 +484,50 @@ impl App {
         action
     }
 
+    /// A chip for each source the words match skills from, most skills first,
+    /// with how many; clicking one narrows the results to it, and clicking it
+    /// again shows every source. The picked source keeps its chip even when the
+    /// words match nothing from it, so it can be unpicked.
+    fn source_filter(&self, ui: &mut egui::Ui, counts: &HashMap<String, usize>) -> Option<Action> {
+        let mut chips: Vec<(&str, usize)> = counts.iter().map(|(s, n)| (s.as_str(), *n)).collect();
+        if let Some(f) = &self.filter
+            && !counts.contains_key(f)
+        {
+            chips.push((f.as_str(), 0));
+        }
+        // Unknown last; the rest by count, then name.
+        chips.sort_by(|a, b| (a.0 == UNKNOWN).cmp(&(b.0 == UNKNOWN)).then(b.1.cmp(&a.1)).then(a.0.cmp(b.0)));
+        if chips.len() < 2 && self.filter.is_none() {
+            // One source: nothing to narrow to.
+            return None;
+        }
+        let mut action = None;
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            ui.add_space(8.0);
+            for (source, n) in chips {
+                let picked = self.filter.as_deref() == Some(source);
+                if chip(ui, &format!("{source}  {n}"), picked).on_hover_text(source_hint(source, picked)).clicked() {
+                    action = Some(Action::Filter((!picked).then(|| source.to_string())));
+                }
+            }
+        });
+        ui.add_space(6.0);
+        action
+    }
+
     /// The same search on skills.sh, asked only when Search (or Enter) is
     /// pressed. Each answer replaces the last, its rows opening in.
     fn remote_results(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
         let c = colours();
         let query = self.query.trim().to_string();
         let found = self.remote.found.as_ref().filter(|(q, _)| *q == query).map(|(_, hits)| hits.clone());
-        let count = match &found {
-            Some(Ok(hits)) => format!("{} found", hits.len()),
+        let count = match (&found, &self.filter) {
+            (Some(Ok(hits)), Some(f)) => {
+                format!("{} of {} found", hits.iter().filter(|h| h.source == *f).count(), hits.len())
+            }
+            (Some(Ok(hits)), None) => format!("{} found", hits.len()),
             _ => String::new(),
         };
         group_heading(ui, "On skills.sh", &count);
@@ -479,8 +554,13 @@ impl App {
                 search_button(ui, "Try again");
             }
             Some(Ok(hits)) if hits.is_empty() => weak(ui, "Nothing on skills.sh matches."),
+            Some(Ok(hits)) if self.filter.as_ref().is_some_and(|f| hits.iter().all(|h| h.source != *f)) => {
+                let f = self.filter.as_deref().unwrap_or_default();
+                weak(ui, &format!("None of the {} found come from {f}.", hits.len()));
+            }
             Some(Ok(hits)) => {
-                for hit in &hits {
+                let filter = self.filter.clone();
+                for hit in hits.iter().filter(|h| filter.as_ref().is_none_or(|f| h.source == *f)) {
                     let installed = report.skills.contains(&hit.skill_id);
                     // New to this answer: opens in. Kept from the last: stays put.
                     let id = Id::unique(("remote-row", &hit.id));
@@ -561,6 +641,7 @@ impl App {
         ui: &mut egui::Ui,
         name: &str,
         desc: Option<&str>,
+        source: &str,
         shown: bool,
     ) -> Option<Action> {
         let mut action = None;
@@ -597,7 +678,14 @@ impl App {
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.add_space(4.0);
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new(name).color(c.text));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(RichText::new(name).color(c.text));
+                                let picked = self.filter.as_deref() == Some(source);
+                                if chip(ui, source, picked).on_hover_text(source_hint(source, picked)).clicked() {
+                                    action = Some(Action::Filter((!picked).then(|| source.to_string())));
+                                }
+                            });
                             if let Some(d) = desc {
                                 ui.add(egui::Label::new(RichText::new(d).small().color(c.text_weak)).truncate());
                             }
@@ -633,7 +721,11 @@ impl App {
         let (title, from, link) = match &dialog {
             Dialog::Local(name) => {
                 let folder = config.as_ref().map(|c| c.source.join(name));
-                let from = folder.as_deref().map(contract).unwrap_or_default();
+                let at = folder.as_deref().map(contract).unwrap_or_default();
+                let from = match self.sources.get(name) {
+                    Some(source) => format!("{source} \u{b7} {at}"),
+                    None => at,
+                };
                 (name.clone(), from, folder.map(|f| ("Open folder", f)))
             }
             Dialog::Remote(hit) => {
@@ -1033,6 +1125,42 @@ fn group_heading(ui: &mut egui::Ui, title: &str, count: &str) {
         });
     });
     ui.add_space(2.0);
+}
+
+/// What a source chip says when hovered.
+fn source_hint(source: &str, picked: bool) -> String {
+    if picked {
+        "Show every source".into()
+    } else if source == UNKNOWN {
+        "Installed by neither the skills CLI nor Skillster, so where it came from isn't known. Click to show only these"
+            .into()
+    } else {
+        format!("Show only the skills from {source}")
+    }
+}
+
+/// A small rounded label that can be clicked: filled with the accent while
+/// `picked`, a faint fill otherwise that brightens when hovered.
+fn chip(ui: &mut egui::Ui, text: &str, picked: bool) -> egui::Response {
+    let c = colours();
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
+    let size = Vec2::new(galley.size().x + 14.0, galley.size().y + 4.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered() || response.has_focus();
+        let (fill, colour) = match (picked, hovered) {
+            (true, false) => (c.accent, c.on_accent),
+            (true, true) => (c.accent.gamma_multiply(0.88), c.on_accent),
+            (false, false) => (c.button.0, c.text_weak),
+            (false, true) => (c.button_hovered.0, c.text_strong),
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(255), fill);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, colour);
+    }
+    response
 }
 
 fn view_key(skill: &str) -> String {
