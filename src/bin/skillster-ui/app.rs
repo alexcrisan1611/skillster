@@ -35,6 +35,11 @@ const DIFF_LINES: usize = 300;
 const CONFIRM: Duration = Duration::from_secs(4);
 /// Long enough for a deleted skill's row to close.
 const LEAVING: Duration = Duration::from_millis(600);
+/// How long the dialog takes to open and to close.
+const DIALOG_IN: f32 = 0.18;
+const DIALOG_OUT: f32 = 0.12;
+/// How tall the fades over the dialog's text are.
+const FADE: f32 = 36.0;
 
 pub struct App {
     config_path: PathBuf,
@@ -59,6 +64,29 @@ pub struct App {
     leaving: Vec<(String, Instant)>,
     skills_sh: skills_sh::Client,
     remote: Remote,
+    /// The skill shown in the dialog; kept while the dialog fades out.
+    dialog: Option<Dialog>,
+    /// Whether the dialog is open, rather than closing.
+    dialog_open: bool,
+}
+
+/// A skill to read in the dialog.
+#[derive(Clone)]
+enum Dialog {
+    /// One in the source, by name.
+    Local(String),
+    /// One on skills.sh.
+    Remote(Hit),
+}
+
+impl Dialog {
+    /// The row it was opened from, for that row's highlight.
+    fn row_key(&self) -> String {
+        match self {
+            Dialog::Local(name) => view_key(name),
+            Dialog::Remote(hit) => remote_key(&hit.id),
+        }
+    }
 }
 
 /// The search on skills.sh.
@@ -82,14 +110,13 @@ struct Notice {
 enum Action {
     Fix(Vec<Problem>),
     Toggle(String),
-    /// Shows or hides a skill in the source; showing one hides the others.
+    /// Opens a skill in the source, by name, in the dialog.
     View(String),
     StartDaemon,
     Open(PathBuf),
     /// Asks before deleting: the first click arms it, the second deletes.
     Delete(String),
-    /// Shows or hides a skill on skills.sh, fetching it the first time; showing
-    /// one hides the others.
+    /// Opens a skill on skills.sh in the dialog, fetching it the first time.
     ViewRemote(Hit),
     Install(Hit),
     /// Searches skills.sh.
@@ -133,6 +160,8 @@ impl App {
                 files: HashMap::new(),
                 installing: HashSet::new(),
             },
+            dialog: None,
+            dialog_open: false,
         }
     }
 
@@ -166,15 +195,14 @@ impl App {
         }
     }
 
-    /// Shows the skill under `k`, hiding every other one shown, or hides it if
-    /// it is the one shown. True if it is now shown.
-    fn view(&mut self, k: String) -> bool {
-        if self.open.remove(&k) {
-            return false;
-        }
-        self.open.retain(|o| !is_view(o));
-        self.open.insert(k);
-        true
+    fn open_dialog(&mut self, dialog: Dialog) {
+        self.dialog = Some(dialog);
+        self.dialog_open = true;
+    }
+
+    /// The key of the row whose skill the dialog shows, while it is open.
+    fn viewing(&self) -> Option<String> {
+        self.dialog.as_ref().filter(|_| self.dialog_open).map(Dialog::row_key)
     }
 
     fn notify(&mut self, text: String, error: bool) {
@@ -189,22 +217,19 @@ impl App {
                 }
             }
             Action::Open(p) => platform::open(&p),
-            Action::View(k) => {
-                self.view(k);
-            }
+            Action::View(name) => self.open_dialog(Dialog::Local(name)),
             Action::Search(query) => {
                 self.remote.found = None;
                 self.skills_sh.send(Request::Search(query.clone()));
                 self.remote.asked = query;
             }
             Action::ViewRemote(hit) => {
-                if self.view(remote_key(&hit.id)) {
-                    // Fetched once; a failed fetch is tried again.
-                    if !matches!(self.remote.files.get(&hit.id), Some(Ok(_))) {
-                        self.remote.files.remove(&hit.id);
-                        self.skills_sh.send(Request::Fetch(hit));
-                    }
+                // Fetched once; a failed fetch is tried again.
+                if !matches!(self.remote.files.get(&hit.id), Some(Ok(_))) {
+                    self.remote.files.remove(&hit.id);
+                    self.skills_sh.send(Request::Fetch(hit.clone()));
                 }
+                self.open_dialog(Dialog::Remote(hit));
             }
             Action::Install(hit) => {
                 let Some(Ok(config)) = self.scan.as_ref().map(|s| &s.config) else { return };
@@ -220,7 +245,9 @@ impl App {
                 let Some(Ok(config)) = self.scan.as_ref().map(|s| s.config.clone()) else { return };
                 match status::remove(&config, &skill, &platform::backups_dir()) {
                     Ok(msg) => {
-                        self.open.remove(&view_key(&skill));
+                        if matches!(&self.dialog, Some(Dialog::Local(n)) if *n == skill) {
+                            self.dialog_open = false;
+                        }
                         self.leaving.push((skill, Instant::now()));
                         self.notify(msg, false);
                     }
@@ -362,7 +389,8 @@ impl App {
         let search = (entered && query.chars().count() >= 2).then(|| Action::Search(query.to_string()));
         if clearable {
             let centre = Pos2::new(response.rect.right() - 19.0, response.rect.center().y);
-            if clear_button(ui, centre).clicked() {
+            let rect = Rect::from_center_size(centre, Vec2::splat(24.0));
+            if close_button(ui, rect, "search-clear", "Clear the search (Esc)").clicked() {
                 self.query.clear();
                 ui.memory_mut(|m| m.request_focus(id));
             }
@@ -406,7 +434,7 @@ impl App {
         }
         let mut action = None;
         for (name, desc, matches) in rows {
-            if let Some(a) = self.result(ui, config, &name, desc.as_deref(), matches) {
+            if let Some(a) = self.result(ui, &name, desc.as_deref(), matches) {
                 action = Some(a);
             }
         }
@@ -476,7 +504,7 @@ impl App {
     fn remote_result(&mut self, ui: &mut egui::Ui, config: &Config, hit: &Hit, installed: bool) -> Option<Action> {
         let c = colours();
         let k = remote_key(&hit.id);
-        let viewing = self.open.contains(&k);
+        let viewing = self.viewing().as_ref() == Some(&k);
         let installing = self.remote.installing.contains(&hit.id);
         let mut action = None;
         let backdrop = ui.painter().add(Shape::Noop);
@@ -497,7 +525,7 @@ impl App {
                     {
                         action = Some(Action::Install(hit.clone()));
                     }
-                    if ui.button(if viewing { "Hide" } else { "View" }).clicked() {
+                    if ui.button("View").clicked() {
                         action = Some(Action::ViewRemote(hit.clone()));
                     }
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -511,40 +539,6 @@ impl App {
             })
             .response;
         self.backdrop(ui, backdrop, response.rect, &k, viewing);
-        let mut view = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("remote-view", &hit.id)), false);
-        view.set_open(viewing);
-        let opened = view.openness(ui.ctx());
-        view.show_body_unindented(ui, |ui| {
-            ui.set_opacity(opened);
-            ui.add_space(4.0);
-            panel().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                match self.remote.files.get(&hit.id) {
-                    None => {
-                        ui.label(RichText::new("Fetching it from skills.sh\u{2026}").color(c.text_weak));
-                    }
-                    Some(Err(e)) => {
-                        ui.label(RichText::new(format!("Couldn't fetch it: {e}")).color(c.error));
-                    }
-                    Some(Ok(files)) => {
-                        let text = skills_sh::skill_md(files).unwrap_or("It has no SKILL.md.");
-                        egui::ScrollArea::vertical().id_salt(("remote-view", &hit.id)).max_height(260.0).show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(text).monospace().color(c.text)).wrap());
-                        });
-                        if files.len() > 1 {
-                            ui.add_space(6.0);
-                            let more = format!("And {} more files.", files.len() - 1);
-                            ui.label(RichText::new(more).small().color(c.text_weak));
-                        }
-                    }
-                }
-                ui.add_space(10.0);
-                if ui.button("Open on skills.sh").clicked() {
-                    action = Some(Action::Open(PathBuf::from(hit.page())));
-                }
-            });
-            ui.add_space(8.0);
-        });
         action
     }
 
@@ -565,7 +559,6 @@ impl App {
     fn result(
         &mut self,
         ui: &mut egui::Ui,
-        config: &Config,
         name: &str,
         desc: Option<&str>,
         shown: bool,
@@ -578,7 +571,7 @@ impl App {
             ui.set_opacity(openness);
             let c = colours();
             let k = view_key(name);
-            let viewing = self.open.contains(&k);
+            let viewing = self.viewing().as_ref() == Some(&k);
             let confirming = self.confirm.as_ref().is_some_and(|(s, at)| s == name && at.elapsed() < CONFIRM);
             if confirming {
                 ui.ctx().request_repaint_after(CONFIRM);
@@ -598,8 +591,8 @@ impl App {
                         if delete.on_hover_text("Moves it to backups and removes its link from every tool").clicked() {
                             action = Some(Action::Delete(name.to_string()));
                         }
-                        if ui.button(if viewing { "Hide" } else { "View" }).clicked() {
-                            action = Some(Action::View(k.clone()));
+                        if ui.button("View").clicked() {
+                            action = Some(Action::View(name.to_string()));
                         }
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.add_space(4.0);
@@ -613,43 +606,129 @@ impl App {
                 })
                 .response;
             self.backdrop(ui, backdrop, response.rect, &k, viewing);
-            let mut view = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("view", name)), false);
-            view.set_open(viewing);
-            let opened = view.openness(ui.ctx());
-            view.show_body_unindented(ui, |ui| {
-                ui.set_opacity(opened);
-                ui.add_space(4.0);
-                if let Some(a) = self.quick_view(ui, config, name) {
-                    action = Some(a);
-                }
-                ui.add_space(8.0);
-            });
         });
         action
     }
 
-    /// A skill's `SKILL.md`, and a way to its folder.
-    fn quick_view(&mut self, ui: &mut egui::Ui, config: &Config, name: &str) -> Option<Action> {
+    /// The skill being read, in a dialog over the window: its name and where it
+    /// comes from, a close button, its `SKILL.md` fading out at whichever edge
+    /// has more to scroll to, and a way to its folder or page. Escape, the close
+    /// button or a click outside closes it. It fades and lifts in and out, or
+    /// just appears with reduced motion.
+    fn dialog(&mut self, ctx: &egui::Context) -> Option<Action> {
+        let dialog = self.dialog.clone()?;
+        let open = self.dialog_open;
+        let time = match (self.reduced_motion, open) {
+            (true, _) => 0.0,
+            (false, true) => DIALOG_IN,
+            (false, false) => DIALOG_OUT,
+        };
+        let t = ctx.animate_bool_with_time_and_easing(Id::unique("dialog"), open, time, easing::cubic_out);
+        if !open && t <= 0.0 {
+            self.dialog = None;
+            return None;
+        }
         let c = colours();
+        let config = self.scan.as_ref().and_then(|s| s.config.as_ref().ok()).cloned();
+        let (title, from, link) = match &dialog {
+            Dialog::Local(name) => {
+                let folder = config.as_ref().map(|c| c.source.join(name));
+                let from = folder.as_deref().map(contract).unwrap_or_default();
+                (name.clone(), from, folder.map(|f| ("Open folder", f)))
+            }
+            Dialog::Remote(hit) => {
+                let from = format!("{} \u{b7} {} installs", hit.source, skills_sh::count(hit.installs));
+                (hit.name.clone(), from, Some(("Open on skills.sh", PathBuf::from(hit.page()))))
+            }
+        };
+        let screen = ctx.content_rect();
+        let width = (screen.width() - 64.0).min(760.0);
+        let height = (screen.height() - 220.0).clamp(140.0, 640.0);
+        let lift = if self.reduced_motion { 0.0 } else { 10.0 * (1.0 - t) };
+        let id = Id::unique("dialog-area");
+        let area = egui::Modal::default_area(id).fade_in(false).anchor(Align2::CENTER_CENTER, Vec2::new(0.0, lift));
         let mut action = None;
-        panel().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match self.texts.get(name).and_then(Option::as_deref) {
-                Some(text) => {
-                    egui::ScrollArea::vertical().id_salt(("view", name)).max_height(260.0).show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(text).monospace().color(c.text)).wrap());
+        let mut close = false;
+        let modal = egui::Modal::new(id).area(area).backdrop_color(Color32::TRANSPARENT).frame(egui::Frame::NONE).show(
+            ctx,
+            |ui| {
+                // Our own backdrop, so it follows the window's rounded corners.
+                let shade = Color32::from_black_alpha((if self.light { 70.0 } else { 120.0 } * t) as u8);
+                ui.painter().rect_filled(screen, window::window_radius(ctx), shade);
+                ui.set_opacity(t);
+                theme::card().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                            if close_button(ui, rect, "dialog-close", "Close (Esc)").clicked() {
+                                close = true;
+                            }
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                ui.add_space(2.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let name = RichText::new(&title).font(theme::strong(15.0)).color(c.text_strong);
+                                ui.add(egui::Label::new(name).truncate());
+                                ui.add(egui::Label::new(RichText::new(&from).small().color(c.text_weak)).truncate());
+                            });
+                        });
                     });
-                }
-                None => {
-                    ui.label(RichText::new("This skill has no readable SKILL.md.").color(c.text_weak));
-                }
-            }
-            ui.add_space(10.0);
-            if ui.button("Open folder").clicked() {
-                action = Some(Action::Open(config.source.join(name)));
-            }
-        });
+                    ui.add_space(12.0);
+                    let (text, error, more) = self.dialog_text(&dialog, config.as_ref());
+                    reader(ui, &text, error, height, &title);
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if let Some((label, path)) = link
+                            && ui.button(label).clicked()
+                        {
+                            action = Some(Action::Open(path));
+                        }
+                        if let Some(more) = more {
+                            ui.label(RichText::new(more).small().color(c.text_weak));
+                        }
+                    });
+                });
+            },
+        );
+        if open && (close || modal.should_close()) {
+            self.dialog_open = false;
+        }
+        if t < 1.0 || !open {
+            ctx.request_repaint();
+        }
         action
+    }
+
+    /// What the dialog shows for `dialog`: the text, whether it is a message
+    /// rather than the skill, and a note on any other files.
+    fn dialog_text(&mut self, dialog: &Dialog, config: Option<&Config>) -> (String, bool, Option<String>) {
+        match dialog {
+            Dialog::Local(name) => {
+                let text = config.and_then(|config| {
+                    let source = &config.source;
+                    self.texts.entry(name.clone()).or_insert_with(|| status::skill_text(&source.join(name))).clone()
+                });
+                match text {
+                    Some(text) => (text, false, None),
+                    None => ("This skill has no readable SKILL.md.".into(), true, None),
+                }
+            }
+            Dialog::Remote(hit) => match self.remote.files.get(&hit.id) {
+                None => ("Fetching it from skills.sh\u{2026}".into(), true, None),
+                Some(Err(e)) => (format!("Couldn't fetch it: {e}"), true, None),
+                Some(Ok(files)) => {
+                    let more = match files.len() {
+                        0 | 1 => None,
+                        2 => Some("And 1 more file.".to_string()),
+                        n => Some(format!("And {} more files.", n - 1)),
+                    };
+                    match skills_sh::skill_md(files) {
+                        Some(text) => (text.to_string(), false, more),
+                        None => ("It has no SKILL.md.".into(), true, more),
+                    }
+                }
+            },
+        }
     }
 
     fn list(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
@@ -964,18 +1043,66 @@ fn remote_key(id: &str) -> String {
     format!("remote|{id}")
 }
 
-/// Whether `k` is a skill being viewed, rather than a problem being reviewed.
-fn is_view(k: &str) -> bool {
-    k.starts_with("view|") || k.starts_with("remote|")
+/// The dialog's text, scrolling in an inset panel `height` tall, with a dark
+/// fade at the top while there is more above and at the bottom while there is
+/// more below.
+fn reader(ui: &mut egui::Ui, text: &str, error: bool, height: f32, salt: &str) {
+    let c = colours();
+    let pad = 14.0;
+    egui::Frame::new()
+        .fill(c.code)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin { left: pad as i8, right: 4, top: 0, bottom: 0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let scroll =
+                egui::ScrollArea::vertical().id_salt(("dialog-text", salt)).auto_shrink(false).max_height(height).show(
+                    ui,
+                    |ui| {
+                        // Room for the scroll bar.
+                        ui.set_width(ui.available_width() - 12.0);
+                        ui.add_space(12.0);
+                        let style = RichText::new(text).color(if error { c.text_weak } else { c.text });
+                        ui.add(egui::Label::new(if error { style } else { style.monospace() }).wrap());
+                        ui.add_space(12.0);
+                    },
+                );
+            let view = scroll.inner_rect;
+            let above = scroll.state.clamped_offset().y;
+            let below = scroll.content_size.y - view.height() - above;
+            // Across the panel's left padding too, but inside its rounded corners.
+            let band = view.with_min_x(view.left() - pad);
+            let painter = ui.painter_at(band);
+            let top = Rect::from_min_size(band.left_top(), Vec2::new(band.width(), FADE));
+            let bottom = Rect::from_min_size(band.left_bottom() - Vec2::new(0.0, FADE), top.size());
+            fade(&painter, top, c.code.gamma_multiply((above / FADE).clamp(0.0, 1.0)), true);
+            fade(&painter, bottom, c.code.gamma_multiply((below / FADE).clamp(0.0, 1.0)), false);
+        });
 }
 
-/// The inset panel a row opens into.
-fn panel() -> egui::Frame {
-    egui::Frame::new()
-        .fill(colours().code)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(12))
-        .outer_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
+/// Paints `colour` over `rect`, easing out to nothing towards its bottom when
+/// `down`, or towards its top.
+fn fade(painter: &egui::Painter, rect: Rect, colour: Color32, down: bool) {
+    if colour.a() == 0 {
+        return;
+    }
+    const STEPS: u32 = 12;
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=STEPS {
+        let f = i as f32 / STEPS as f32;
+        let y = rect.top() + f * rect.height();
+        let away = if down { f } else { 1.0 - f };
+        // Smooth at both ends, so the fade has no visible edge.
+        let col = colour.gamma_multiply(1.0 - away * away * (3.0 - 2.0 * away));
+        mesh.colored_vertex(Pos2::new(rect.left(), y), col);
+        mesh.colored_vertex(Pos2::new(rect.right(), y), col);
+        if i > 0 {
+            let n = 2 * i;
+            mesh.add_triangle(n - 2, n - 1, n);
+            mesh.add_triangle(n - 1, n, n + 1);
+        }
+    }
+    painter.add(mesh);
 }
 
 fn is_unshared(p: &Problem) -> bool {
@@ -1085,15 +1212,15 @@ fn check(ui: &mut egui::Ui, colour: Color32) {
     ui.painter().line_segment([p(6.0, 10.5), p(11.5, 4.0)], stroke);
 }
 
-/// The round button that clears the search, drawn over the field's right end:
+/// The round button that clears the search or closes the dialog, over `rect`:
 /// a dark disc with a faint rim and a thin cross, brighter when hovered.
-fn clear_button(ui: &mut egui::Ui, centre: Pos2) -> egui::Response {
+fn close_button(ui: &mut egui::Ui, rect: Rect, id: &str, hint: &str) -> egui::Response {
     let c = colours();
-    let rect = Rect::from_center_size(centre, Vec2::splat(24.0));
+    let centre = rect.center();
     let response = ui
-        .interact(rect, Id::unique("search-clear"), Sense::click())
+        .interact(rect, Id::unique(id), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Clear the search (Esc)");
+        .on_hover_text(hint);
     let hovered = response.hovered() || response.has_focus();
     let (fill, _) = if hovered { c.button_hovered } else { c.button };
     let rim = if hovered { c.text_weak.gamma_multiply(0.5) } else { c.card_stroke };
@@ -1128,12 +1255,16 @@ impl eframe::App for App {
         let mut card = window;
         card.min.y += window::top_gap();
         let inner = Rect::from_min_max(card.min + PAD, card.max - PAD);
-        let action = ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| self.content(ui)).inner;
+        // First, so it takes Escape before the search box sees it.
+        let from_dialog = self.dialog(&ctx);
+        let action = ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| self.content(ui)).inner.or(from_dialog);
         window::frame_controls(ui, window, card);
         window::buttons(&ctx, card, 10.0);
         self.notice(&ctx, card);
         if let Some(action) = action {
             self.run(action);
+            // What it changed, such as an opened dialog, shows next frame.
+            ctx.request_repaint();
         }
     }
 }
