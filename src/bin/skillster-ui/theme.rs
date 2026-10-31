@@ -96,12 +96,49 @@ fn install_fonts(ctx: &egui::Context) {
     // The defaults stay behind ours as fallbacks, for symbols.
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "inter".into());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "mono".into());
+    // Then the system's, for scripts ours lack: Chinese, Japanese, Korean.
+    for (i, bytes) in system_fallbacks().into_iter().enumerate() {
+        let name = format!("system-{i}");
+        fonts.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
     let fallbacks = fonts.families[&FontFamily::Proportional].clone();
     fonts.families.insert(
         FontFamily::Name(STRONG.into()),
         std::iter::once("inter-semibold".to_string()).chain(fallbacks).collect(),
     );
     ctx.set_fonts(fonts);
+}
+
+/// System fonts covering CJK, read from where each OS keeps them: the first
+/// found for Chinese (which also has Japanese kana), then one for Korean.
+fn system_fallbacks() -> Vec<Vec<u8>> {
+    let groups: &[&[&str]] = if cfg!(windows) {
+        &[
+            &["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc", "C:/Windows/Fonts/YuGothR.ttc"],
+            &["C:/Windows/Fonts/malgun.ttf"],
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            &[
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            ],
+            &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+        ]
+    } else {
+        &[&[
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        ]]
+    };
+    groups.iter().filter_map(|paths| paths.iter().find_map(|p| std::fs::read(p).ok())).collect()
 }
 
 const STRONG: &str = "strong";

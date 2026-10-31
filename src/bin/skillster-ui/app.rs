@@ -35,8 +35,6 @@ const DIFF_LINES: usize = 300;
 const CONFIRM: Duration = Duration::from_secs(4);
 /// Long enough for a deleted skill's row to close.
 const LEAVING: Duration = Duration::from_millis(600);
-/// How long the typing pauses before skills.sh is asked.
-const ASK_AFTER: Duration = Duration::from_millis(300);
 
 pub struct App {
     config_path: PathBuf,
@@ -65,9 +63,7 @@ pub struct App {
 
 /// The search on skills.sh.
 struct Remote {
-    /// When the search box last changed.
-    typed: Instant,
-    /// The last search asked for.
+    /// The last search asked for; only Search (or Enter) asks.
     asked: String,
     /// The last answer, and the search it answers.
     found: Option<(String, Result<Vec<Hit>, String>)>,
@@ -86,13 +82,18 @@ struct Notice {
 enum Action {
     Fix(Vec<Problem>),
     Toggle(String),
+    /// Shows or hides a skill in the source; showing one hides the others.
+    View(String),
     StartDaemon,
     Open(PathBuf),
     /// Asks before deleting: the first click arms it, the second deletes.
     Delete(String),
-    /// Shows or hides a skill on skills.sh, fetching it the first time.
+    /// Shows or hides a skill on skills.sh, fetching it the first time; showing
+    /// one hides the others.
     ViewRemote(Hit),
     Install(Hit),
+    /// Searches skills.sh.
+    Search(String),
 }
 
 /// Identifies a problem across scans.
@@ -127,7 +128,6 @@ impl App {
             leaving: Vec::new(),
             skills_sh: skills_sh::Client::spawn(cc.egui_ctx.clone()),
             remote: Remote {
-                typed: Instant::now(),
                 asked: String::new(),
                 found: None,
                 files: HashMap::new(),
@@ -166,6 +166,17 @@ impl App {
         }
     }
 
+    /// Shows the skill under `k`, hiding every other one shown, or hides it if
+    /// it is the one shown. True if it is now shown.
+    fn view(&mut self, k: String) -> bool {
+        if self.open.remove(&k) {
+            return false;
+        }
+        self.open.retain(|o| !is_view(o));
+        self.open.insert(k);
+        true
+    }
+
     fn notify(&mut self, text: String, error: bool) {
         self.notice = Some(Notice { text, error, at: Instant::now() });
     }
@@ -178,10 +189,16 @@ impl App {
                 }
             }
             Action::Open(p) => platform::open(&p),
+            Action::View(k) => {
+                self.view(k);
+            }
+            Action::Search(query) => {
+                self.remote.found = None;
+                self.skills_sh.send(Request::Search(query.clone()));
+                self.remote.asked = query;
+            }
             Action::ViewRemote(hit) => {
-                let k = remote_key(&hit.id);
-                if !self.open.remove(&k) {
-                    self.open.insert(k);
+                if self.view(remote_key(&hit.id)) {
                     // Fetched once; a failed fetch is tried again.
                     if !matches!(self.remote.files.get(&hit.id), Some(Ok(_))) {
                         self.remote.files.remove(&hit.id);
@@ -285,7 +302,9 @@ impl App {
         }
         let mut action = summary(ui, config, &scan.report, scan.daemon_running);
         ui.add_space(14.0);
-        self.search_box(ui, scan.report.skills.len());
+        if let Some(a) = self.search_box(ui, scan.report.skills.len()) {
+            action = Some(a);
+        }
         ui.add_space(10.0);
         let list_height = (ui.available_height() - FOOTER).max(60.0);
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), list_height), Layout::top_down(Align::Min), |ui| {
@@ -319,8 +338,9 @@ impl App {
         });
     }
 
-    /// Ctrl+F (Cmd+F on macOS) focuses it, Escape clears it.
-    fn search_box(&mut self, ui: &mut egui::Ui, count: usize) {
+    /// Ctrl+F (Cmd+F on macOS) focuses it, Escape clears it, Enter searches
+    /// skills.sh too.
+    fn search_box(&mut self, ui: &mut egui::Ui, count: usize) -> Option<Action> {
         let id = Id::unique("search");
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(id));
@@ -337,17 +357,17 @@ impl App {
         if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.query.clear();
         }
-        if response.changed() {
-            self.remote.typed = Instant::now();
-        }
+        let query = self.query.trim();
+        let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let search = (entered && query.chars().count() >= 2).then(|| Action::Search(query.to_string()));
         if clearable {
             let centre = Pos2::new(response.rect.right() - 19.0, response.rect.center().y);
             if clear_button(ui, centre).clicked() {
                 self.query.clear();
-                self.remote.typed = Instant::now();
                 ui.memory_mut(|m| m.request_focus(id));
             }
         }
+        search
     }
 
     /// The source's skills whose name or description has every word searched for.
@@ -397,8 +417,8 @@ impl App {
         action
     }
 
-    /// The same search on skills.sh, asked once the typing pauses. Each answer
-    /// replaces the last, its rows opening in.
+    /// The same search on skills.sh, asked only when Search (or Enter) is
+    /// pressed. Each answer replaces the last, its rows opening in.
     fn remote_results(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
         let c = colours();
         let query = self.query.trim().to_string();
@@ -416,20 +436,19 @@ impl App {
             weak(ui, "Type two letters or more to search skills.sh.");
             return None;
         }
-        if query != self.remote.asked {
-            let wait = ASK_AFTER.saturating_sub(self.remote.typed.elapsed());
-            if wait.is_zero() {
-                self.skills_sh.send(Request::Search(query.clone()));
-                self.remote.asked = query;
-            } else {
-                ui.ctx().request_repaint_after(wait);
-            }
-        }
         let mut action = None;
+        let mut search_button = |ui: &mut egui::Ui, label: &str| {
+            ui.add_space(4.0);
+            if ui.button(label).on_hover_text("Or press Enter in the search box").clicked() {
+                action = Some(Action::Search(query.clone()));
+            }
+        };
         match found {
-            None => weak(ui, "Searching skills.sh\u{2026}"),
+            None if self.remote.asked == query => weak(ui, "Searching skills.sh\u{2026}"),
+            None => search_button(ui, &format!("Search skills.sh for \u{201c}{query}\u{201d}")),
             Some(Err(e)) => {
                 ui.label(RichText::new(format!("Couldn't reach skills.sh: {e}")).color(c.error));
+                search_button(ui, "Try again");
             }
             Some(Ok(hits)) if hits.is_empty() => weak(ui, "Nothing on skills.sh matches."),
             Some(Ok(hits)) => {
@@ -580,7 +599,7 @@ impl App {
                             action = Some(Action::Delete(name.to_string()));
                         }
                         if ui.button(if viewing { "Hide" } else { "View" }).clicked() {
-                            action = Some(Action::Toggle(k.clone()));
+                            action = Some(Action::View(k.clone()));
                         }
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.add_space(4.0);
@@ -943,6 +962,11 @@ fn view_key(skill: &str) -> String {
 
 fn remote_key(id: &str) -> String {
     format!("remote|{id}")
+}
+
+/// Whether `k` is a skill being viewed, rather than a problem being reviewed.
+fn is_view(k: &str) -> bool {
+    k.starts_with("view|") || k.starts_with("remote|")
 }
 
 /// The inset panel a row opens into.

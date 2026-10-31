@@ -21,9 +21,10 @@ const MAX_REPLY: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Hit {
-    /// `owner/repo/skill`, which is also its page on skills.sh.
+    /// `owner/repo/skill` for a GitHub repo, `domain/skill` for a site.
     pub id: String,
-    /// `owner/repo`.
+    /// `owner/repo`, or the domain of a site that publishes its skills under
+    /// `/.well-known/skills/`.
     pub source: String,
     /// The skill's folder name.
     #[serde(rename = "skillId")]
@@ -33,9 +34,32 @@ pub struct Hit {
     pub installs: u64,
 }
 
+/// Where a skill's files come from.
+#[derive(Debug, PartialEq)]
+enum Origin<'a> {
+    Repo { owner: &'a str, repo: &'a str },
+    Site { domain: &'a str },
+}
+
 impl Hit {
+    fn origin(&self) -> Result<Origin<'_>, String> {
+        let origin = match self.source.split_once('/') {
+            Some((owner, repo)) if safe_name(owner) && safe_name(repo) => Origin::Repo { owner, repo },
+            None if safe_domain(&self.source) => Origin::Site { domain: &self.source },
+            _ => return Err(format!("odd source {}", self.source)),
+        };
+        if !safe_name(&self.skill_id) {
+            return Err(format!("odd name {}", self.id));
+        }
+        Ok(origin)
+    }
+
+    /// Its page on skills.sh.
     pub fn page(&self) -> String {
-        format!("{BASE}/{}", self.id)
+        match self.origin() {
+            Ok(Origin::Site { domain }) => format!("{BASE}/site/{domain}/{}", self.skill_id),
+            _ => format!("{BASE}/{}", self.id),
+        }
     }
 }
 
@@ -54,6 +78,19 @@ struct SearchReply {
 #[derive(Deserialize)]
 struct DownloadReply {
     files: Vec<File>,
+}
+
+/// A site's `/.well-known/skills/index.json`.
+#[derive(Deserialize)]
+struct SiteIndex {
+    skills: Vec<SiteSkill>,
+}
+
+#[derive(Deserialize)]
+struct SiteSkill {
+    name: String,
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 pub enum Request {
@@ -135,12 +172,33 @@ fn search(agent: &ureq::Agent, query: &str) -> Result<Vec<Hit>, String> {
 }
 
 fn download(agent: &ureq::Agent, hit: &Hit) -> Result<Vec<File>, String> {
-    let (owner, repo) = hit.source.split_once('/').ok_or_else(|| format!("odd source {}", hit.source))?;
-    if ![owner, repo, &hit.skill_id].iter().all(|s| safe_name(s)) {
-        return Err(format!("odd name {}", hit.id));
+    let skill = &hit.skill_id;
+    match hit.origin()? {
+        Origin::Repo { owner, repo } => {
+            let body = get(agent, &format!("{BASE}/api/download/{owner}/{repo}/{skill}"), &[])?;
+            Ok(serde_json::from_str::<DownloadReply>(&body).map_err(|e| e.to_string())?.files)
+        }
+        // As the `skills` CLI fetches them: the site's index lists each skill's
+        // files, which sit in a folder named after it.
+        Origin::Site { domain } => {
+            let root = format!("https://{domain}/.well-known/skills");
+            let body = get(agent, &format!("{root}/index.json"), &[])?;
+            let index = serde_json::from_str::<SiteIndex>(&body).map_err(|e| e.to_string())?;
+            let entry = index
+                .skills
+                .into_iter()
+                .find(|s| s.name == *skill)
+                .ok_or_else(|| format!("{domain} no longer lists {skill}"))?;
+            if let Some(bad) = entry.files.iter().find(|f| !safe_path(f)) {
+                return Err(format!("{skill} has a file outside its folder: {bad}"));
+            }
+            entry
+                .files
+                .into_iter()
+                .map(|path| Ok(File { contents: get(agent, &format!("{root}/{skill}/{path}"), &[])?, path }))
+                .collect()
+        }
     }
-    let body = get(agent, &format!("{BASE}/api/download/{owner}/{repo}/{}", hit.skill_id), &[])?;
-    Ok(serde_json::from_str::<DownloadReply>(&body).map_err(|e| e.to_string())?.files)
 }
 
 /// The skill's `SKILL.md`, from its files.
@@ -188,6 +246,17 @@ pub fn install(source: &Path, name: &str, files: &[File]) -> Result<String, Stri
 
 fn safe_name(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// A host name: letters, digits, dots and hyphens, with a dot somewhere.
+fn safe_domain(s: &str) -> bool {
+    s.contains('.')
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 /// A relative path that stays inside the skill folder on every OS.
@@ -241,6 +310,23 @@ mod tests {
         let left: Vec<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left, ["a"], "nothing half-written is left behind");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn hit(id: &str, source: &str, skill: &str) -> Hit {
+        Hit { id: id.into(), source: source.into(), skill_id: skill.into(), name: skill.into(), installs: 0 }
+    }
+
+    #[test]
+    fn pages_and_origins() {
+        let repo = hit("larksuite/cli/lark-shared", "larksuite/cli", "lark-shared");
+        assert_eq!(repo.page(), "https://skills.sh/larksuite/cli/lark-shared");
+        assert_eq!(repo.origin(), Ok(Origin::Repo { owner: "larksuite", repo: "cli" }));
+        let site = hit("open.feishu.cn/lark-shared", "open.feishu.cn", "lark-shared");
+        assert_eq!(site.page(), "https://skills.sh/site/open.feishu.cn/lark-shared");
+        assert_eq!(site.origin(), Ok(Origin::Site { domain: "open.feishu.cn" }));
+        for (source, skill) in [("localhost", "a"), ("a/../b", "a"), ("evil.com:8080", "a"), ("a.b", "../x"), ("-a.b", "a")] {
+            assert!(hit("x", source, skill).origin().is_err(), "{source} {skill}");
+        }
     }
 
     #[test]
