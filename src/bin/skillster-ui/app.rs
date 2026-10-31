@@ -17,6 +17,7 @@ use skillster::platform::{self, DAEMON_EXE, normalize};
 use skillster::status::{self, Kind, Problem, Report};
 
 use crate::skills_sh::{self, Hit, Reply, Request};
+use crate::library::{self, Installs};
 use crate::sources;
 use crate::theme::{self, colours};
 use crate::watch::{Scan, Scanner};
@@ -71,11 +72,26 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Whether the dialog is open, rather than closing.
     dialog_open: bool,
+    /// What the list shows with nothing searched for.
+    tab: Tab,
+    /// Install counts from skills.sh, for "All skills".
+    counts: library::Counts,
+    /// Whether "All skills" lists the most installed first, rather than by name.
+    by_installs: bool,
     /// Each source skill's source, by name; read again with every scan.
     sources: HashMap<String, String>,
     /// The source the results are narrowed to; while set, the list shows the
     /// skills from it even with nothing typed.
     filter: Option<String>,
+}
+
+/// The two sections of the list.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    /// What needs fixing in each folder.
+    Fix,
+    /// Every skill in the source, where it came from and how often it is installed.
+    All,
 }
 
 /// A skill to read in the dialog.
@@ -172,6 +188,9 @@ impl App {
             },
             dialog: None,
             dialog_open: false,
+            tab: Tab::Fix,
+            counts: library::Counts::spawn(cc.egui_ctx.clone()),
+            by_installs: false,
             sources: sources::read(),
             filter: None,
         }
@@ -349,6 +368,8 @@ impl App {
         }
         let mut action = summary(ui, config, &scan.report, scan.daemon_running);
         ui.add_space(14.0);
+        self.tabs(ui, &scan.report);
+        ui.add_space(10.0);
         if let Some(a) = self.search_box(ui, scan.report.skills.len()) {
             action = Some(a);
         }
@@ -359,7 +380,10 @@ impl App {
                 // Room for the scroll bar.
                 ui.set_width(ui.available_width() - 10.0);
                 let found = if self.query.trim().is_empty() && self.filter.is_none() {
-                    self.list(ui, config, &scan.report)
+                    match self.tab {
+                        Tab::Fix => self.list(ui, config, &scan.report),
+                        Tab::All => self.library(ui, config, &scan.report),
+                    }
                 } else {
                     self.results(ui, config, &scan.report)
                 };
@@ -821,6 +845,168 @@ impl App {
                 }
             },
         }
+    }
+
+    /// "To fix" or "All skills", for what the list shows with nothing searched for.
+    fn tabs(&mut self, ui: &mut egui::Ui, report: &Report) {
+        let fixes = report.problems.len();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let tabs = [
+                (Tab::Fix, format!("To fix \u{b7} {fixes}")),
+                (Tab::All, format!("All skills \u{b7} {}", report.skills.len())),
+            ];
+            for (tab, label) in tabs {
+                let selected = self.tab == tab;
+                let colour = if selected { colours().text_strong } else { colours().text_weak };
+                if ui.selectable_label(selected, RichText::new(label).font(theme::strong(13.0)).color(colour)).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+    }
+
+    /// Every skill in the source: where it came from, how often skills.sh says it
+    /// has been installed, and View and Delete.
+    fn library(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
+        let c = colours();
+        let mut action = None;
+        let mut rows = Vec::new();
+        for name in &report.skills {
+            let text = self.texts.entry(name.clone()).or_insert_with(|| status::skill_text(&config.source.join(name)));
+            let desc = text.as_deref().and_then(status::description);
+            let source = self.sources.get(name).cloned();
+            // None for a skill skills.sh can't list: one from a folder, or from nowhere known.
+            let installs = source.as_deref().and_then(|s| library::skills_sh_id(s, name)).map(|id| self.counts.get(&id, name));
+            rows.push((name.clone(), desc, source, installs));
+        }
+        if self.by_installs {
+            let count = |i: &Option<Installs>| match i {
+                Some(Installs::Count(n)) => *n,
+                _ => 0,
+            };
+            rows.sort_by_key(|r| std::cmp::Reverse(count(&r.3)));
+        }
+        let known = rows.iter().filter(|r| r.2.is_some()).count();
+        ui.horizontal(|ui| {
+            let title = format!("Skills in {}", contract(&config.source));
+            ui.label(RichText::new(title).font(theme::strong(12.5)).color(c.text_weak));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (by_installs, label) in [(true, "Most installed"), (false, "Name")].into_iter() {
+                    let selected = self.by_installs == by_installs;
+                    let colour = if selected { c.text } else { c.text_weak };
+                    if ui.selectable_label(selected, RichText::new(label).small().color(colour)).clicked() {
+                        self.by_installs = by_installs;
+                    }
+                }
+                ui.label(RichText::new("Sort by").small().color(c.text_weak));
+            });
+        });
+        ui.horizontal(|ui| {
+            let note = format!("{known} of {} have a known source.", rows.len());
+            ui.label(RichText::new(note).small().color(c.text_weak));
+            if self.counts.any_failed() && ui.small_button("Retry install counts").clicked() {
+                self.counts.retry();
+            }
+        });
+        ui.add_space(4.0);
+        if rows.is_empty() {
+            ui.label(RichText::new("The source has no skills yet.").color(c.text_weak));
+        }
+        for (name, desc, source, installs) in &rows {
+            if let Some(a) = self.library_row(ui, name, desc.as_deref(), source.as_deref(), installs.as_ref()) {
+                action = Some(a);
+            }
+        }
+        action
+    }
+
+    /// One skill in "All skills": its name, its source (a link to the repo or
+    /// site) and description, its install count, View and Delete.
+    fn library_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &str,
+        desc: Option<&str>,
+        source: Option<&str>,
+        installs: Option<&Installs>,
+    ) -> Option<Action> {
+        let c = colours();
+        let k = view_key(name);
+        let viewing = self.viewing().as_ref() == Some(&k);
+        let confirming = self.confirm.as_ref().is_some_and(|(s, at)| s == name && at.elapsed() < CONFIRM);
+        if confirming {
+            ui.ctx().request_repaint_after(CONFIRM);
+        }
+        let mut action = None;
+        let backdrop = ui.painter().add(Shape::Noop);
+        let response = ui
+            .horizontal(|ui| {
+                ui.set_min_height(42.0);
+                ui.add_space(8.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    let delete = if confirming {
+                        ui.button(RichText::new("Confirm delete").color(c.error))
+                    } else {
+                        ui.button("Delete")
+                    };
+                    if delete.on_hover_text("Moves it to backups and removes its link from every tool").clicked() {
+                        action = Some(Action::Delete(name.to_string()));
+                    }
+                    if ui.button("View").clicked() {
+                        action = Some(Action::View(name.to_string()));
+                    }
+                    let (text, colour, hint) = match installs {
+                        Some(Installs::Count(n)) => {
+                            (format!("{} installs", skills_sh::count(*n)), c.text, "Installs counted by skills.sh".into())
+                        }
+                        Some(Installs::Asking) => ("\u{2026}".into(), c.text_weak, "Asking skills.sh".into()),
+                        Some(Installs::Unlisted) => {
+                            ("Not on skills.sh".into(), c.text_weak, "skills.sh doesn't list this skill".into())
+                        }
+                        Some(Installs::Failed(e)) => ("No count".into(), c.warn, format!("Couldn't ask skills.sh: {e}")),
+                        None if source.is_some() => {
+                            ("\u{2014}".into(), c.text_weak, "Installed from a folder, which skills.sh doesn't list".into())
+                        }
+                        None => ("\u{2014}".into(), c.text_weak, "Where it came from isn't known".into()),
+                    };
+                    ui.allocate_ui_with_layout(Vec2::new(96.0, 20.0), Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(text).small().color(colour)).on_hover_text(hint);
+                    });
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.add(egui::Label::new(RichText::new(name).color(c.text)).truncate());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            match source.map(|s| (s, library::source_url(s))) {
+                                Some((s, Some(url))) => {
+                                    let link = ui.link(RichText::new(s).small()).on_hover_text(format!("Open {url}"));
+                                    if link.clicked() {
+                                        action = Some(Action::Open(PathBuf::from(url)));
+                                    }
+                                }
+                                Some((s, None)) => {
+                                    ui.label(RichText::new(s).small().color(c.text_weak));
+                                }
+                                None => {
+                                    ui.label(RichText::new("Source unknown").small().color(c.text_weak));
+                                }
+                            }
+                            if let Some(d) = desc {
+                                let d = format!(" \u{b7} {d}");
+                                ui.add(egui::Label::new(RichText::new(d).small().color(c.text_weak)).truncate());
+                            }
+                        });
+                    });
+                });
+            })
+            .response;
+        self.backdrop(ui, backdrop, response.rect, &k, viewing);
+        action
     }
 
     fn list(&mut self, ui: &mut egui::Ui, config: &Config, report: &Report) -> Option<Action> {
