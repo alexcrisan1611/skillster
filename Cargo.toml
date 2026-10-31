@@ -1,6 +1,6 @@
 [package]
 name = "skillster"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Keeps one folder of agent skills linked into every skills folder that should have them"
