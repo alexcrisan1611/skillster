@@ -1,5 +1,5 @@
 //! The look, after Fracst's: bundled fonts, one card filling the window,
-//! Dark or Light as the system is, and the icon's indigo as the accent.
+//! Dark or Light as the system is, and the icon's teal (oklch hue 205) as the accent.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,8 +49,8 @@ const DARK: Colours = Colours {
     code: Color32::from_rgb(13, 13, 17),
     button: (rgba(48, 48, 56, 200), rgba(38, 38, 46, 190)),
     button_hovered: (rgba(62, 62, 72, 220), rgba(56, 56, 66, 220)),
-    accent: Color32::from_rgb(150, 140, 255),
-    on_accent: Color32::from_rgb(12, 12, 16),
+    accent: Color32::from_rgb(0x38, 0xC3, 0xD0), // oklch(0.75 0.115 205): WCAG 8.72, APCA -60 on the card
+    on_accent: Color32::from_rgb(0x11, 0x11, 0x14),
     added: Color32::from_rgb(120, 200, 140),
     removed: Color32::from_rgb(230, 120, 110),
     warn: Color32::from_rgb(230, 170, 90),
@@ -69,7 +69,7 @@ const LIGHT: Colours = Colours {
     code: Color32::from_rgb(240, 240, 245),
     button: (Color32::from_black_alpha(22), Color32::from_black_alpha(16)),
     button_hovered: (Color32::from_black_alpha(38), Color32::from_black_alpha(30)),
-    accent: Color32::from_rgb(67, 56, 202),
+    accent: Color32::from_rgb(0x21, 0x80, 0x89), // oklch(0.55 0.085 205): WCAG 4.54, APCA 70 on the card
     on_accent: Color32::WHITE,
     added: Color32::from_rgb(20, 120, 50),
     removed: Color32::from_rgb(180, 40, 30),

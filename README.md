@@ -110,4 +110,5 @@ Pushing a `v*` tag builds every platform and publishes a GitHub release (`.githu
 | `src/pick.rs` | The folder menus |
 | `src/logger.rs` | The log file |
 | `src/platform/` | What differs per OS: links, folders, path syntax, autostart |
-| `assets/` | The icon (`icon.svg` is the source), embedded in the Windows executables by `build.rs`; the window's fonts (Inter, JetBrains Mono, under the SIL Open Font License) |
+| `icon/` | The icon's source: `icon.json` (its hue, grid and Mark), `mark.ts` (how the Mark is drawn) and the kit that renders it. `bun icon/mark.ts && bun icon/kit/render.ts icon/icon.json` rewrites the files in `assets/` |
+| `assets/` | The rendered icon (`icon.png`, and `icon.ico` embedded in the Windows executables by `build.rs`); the window's fonts (Inter, JetBrains Mono, under the SIL Open Font License) |
