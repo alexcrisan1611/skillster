@@ -24,7 +24,7 @@ The search box (Ctrl+F) finds your skills by name or description, to read one's 
 
 <p align="center"><img src="assets/screenshot.png" width="640" alt="The Skillster window listing links to fix"></p>
 
-Works on Windows, Linux and macOS, on x64 and ARM64.
+Works on Windows, Linux and macOS, on x64 and ARM64. Releases are built for Windows only; on Linux and macOS, build it from source.
 
 ## Install
 
@@ -34,10 +34,11 @@ Works on Windows, Linux and macOS, on x64 and ARM64.
 irm https://github.com/alexcrisan1611/skillster/releases/latest/download/install.ps1 | iex
 ```
 
-**Linux / macOS**:
+**Linux / macOS** (no release builds; needs [Rust](https://rustup.rs)):
 
 ```sh
-curl -fsSL https://github.com/alexcrisan1611/skillster/releases/latest/download/install.sh | sh
+git clone https://github.com/alexcrisan1611/skillster && cd skillster
+cargo build --release && target/release/skillster install
 ```
 
 The installer finds the `skills` folders on your computer and lets you pick, with arrow keys, the source and (with space) the targets; folders that already link to the source come ticked, and you can type other paths. On Windows it asks [Everything](https://www.voidtools.com/) (1.4 or 1.5) if it is running, which takes a moment; otherwise, and on Linux and macOS, it searches your home folder.
@@ -91,7 +92,7 @@ cargo build --release      # target/release/skillster, skillsterd and skillster-
 cargo test
 ```
 
-Pushing a `v*` tag builds every platform and publishes a GitHub release (`.github/workflows/release.yml`).
+Pushing a `v*` tag builds Windows (x64 and ARM64) and publishes a GitHub release (`.github/workflows/release.yml`).
 
 ## Layout
 
