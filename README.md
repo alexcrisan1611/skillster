@@ -20,6 +20,8 @@ Copies are never deleted: they are moved into a `backups` folder next to the log
 
 The search box (Ctrl+F) finds your skills by name or description, to read one's `SKILL.md` or delete it (it goes to `backups`, and its links go from every tool). It searches [skills.sh](https://skills.sh) at the same time: **Install** puts a skill from there into the source, and every tool gets it. The window also says whether background sync is running, and can start it.
 
+**Projects** lists the projects on your computer with skills of their own (`app/.claude/skills`, `app/.agents/skills`...), found the way the installer finds folders and with the same ones left out (caches, extensions, packages, temp folders, backups, worktrees, tools' own folders). Click a project to see its skills and read any of them; nothing there can be changed. The eye icon ignores a project from then on; ignored projects are listed at the end, to list again.
+
 <p align="center"><img src="assets/screenshot.png" width="640" alt="The Skillster window listing links to fix"></p>
 
 Works on Windows, Linux and macOS, on x64 and ARM64.
@@ -103,7 +105,7 @@ Pushing a `v*` tag builds every platform and publishes a GitHub release (`.githu
 | `src/status.rs` | What each target holds for each skill, and fixing it, for the window |
 | `src/watch.rs` | The background loop: file watching, rescans, config reload |
 | `src/install.rs` | `install` / `uninstall` |
-| `src/find.rs` | Finding `skills` folders for the installer |
+| `src/find.rs` | Finding `skills` folders: for the installer, and projects' own for the window |
 | `src/everything.rs` | Asking a running Everything over its IPC (Windows) |
 | `src/pick.rs` | The folder menus |
 | `src/logger.rs` | The log file |

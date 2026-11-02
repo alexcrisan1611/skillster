@@ -7,6 +7,7 @@
 
 mod app;
 mod library;
+mod projects;
 mod skills_sh;
 mod sources;
 mod theme;

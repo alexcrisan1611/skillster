@@ -1,7 +1,8 @@
 //! The window's contents: skills missing from the source, then what needs fixing
 //! in each folder, then the folders that are fine as one line each. Searching
 //! lists the skills in the source instead, to look at or delete, and the ones
-//! on skills.sh, to look at or install.
+//! on skills.sh, to look at or install. "Projects" lists the projects on this
+//! computer with skills of their own, only to look at.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use skillster::status::{self, Kind, Problem, Report};
 
 use crate::skills_sh::{self, Hit, Reply, Request};
 use crate::library::{self, Installs};
+use crate::projects::{self, Finder, Project, Skill};
 use crate::sources;
 use crate::theme::{self, colours};
 use crate::watch::{Scan, Scanner};
@@ -83,6 +85,15 @@ pub struct App {
     /// The source the results are narrowed to; while set, the list shows the
     /// skills from it even with nothing typed.
     filter: Option<String>,
+    /// Finds the projects with skills of their own, for "Projects".
+    finder: Finder,
+    /// The projects left out of "Projects", by path.
+    ignored: Vec<PathBuf>,
+    /// Whether "Projects" lists the ignored ones at its end.
+    show_ignored: bool,
+    /// Projects' skills' `SKILL.md`, by folder, read when first viewed; cleared
+    /// whenever the projects are looked for again.
+    project_texts: HashMap<PathBuf, Option<String>>,
 }
 
 /// The two sections of the list.
@@ -92,6 +103,8 @@ enum Tab {
     Fix,
     /// Every skill in the source, where it came from and how often it is installed.
     All,
+    /// The projects on this computer with skills of their own.
+    Projects,
 }
 
 /// A skill to read in the dialog.
@@ -101,6 +114,8 @@ enum Dialog {
     Local(String),
     /// One on skills.sh.
     Remote(Hit),
+    /// One of a project's, by its folder.
+    Project(PathBuf),
 }
 
 impl Dialog {
@@ -109,6 +124,7 @@ impl Dialog {
         match self {
             Dialog::Local(name) => view_key(name),
             Dialog::Remote(hit) => remote_key(&hit.id),
+            Dialog::Project(dir) => project_skill_key(dir),
         }
     }
 }
@@ -147,6 +163,12 @@ enum Action {
     Search(String),
     /// Narrows the results to one source, or shows every source again.
     Filter(Option<String>),
+    /// Opens a project's skill, by its folder, in the dialog.
+    ViewProject(PathBuf),
+    /// Leaves a project out of "Projects" from now on (true), or lists it again.
+    Ignore(PathBuf, bool),
+    /// Looks for projects again.
+    FindProjects,
 }
 
 /// Identifies a problem across scans.
@@ -193,6 +215,10 @@ impl App {
             by_installs: false,
             sources: sources::read(),
             filter: None,
+            finder: Finder::spawn(cc.egui_ctx.clone()),
+            ignored: projects::ignored(),
+            show_ignored: false,
+            project_texts: HashMap::new(),
         }
     }
 
@@ -214,6 +240,9 @@ impl App {
     }
 
     fn take_replies(&mut self) {
+        if self.finder.take() {
+            self.project_texts.clear();
+        }
         while let Ok(reply) = self.skills_sh.replies.try_recv() {
             match reply {
                 Reply::Found { query, hits } => self.remote.found = Some((query, hits)),
@@ -256,6 +285,17 @@ impl App {
             Action::Open(p) => platform::open(&p),
             Action::Filter(source) => self.filter = source,
             Action::View(name) => self.open_dialog(Dialog::Local(name)),
+            Action::ViewProject(dir) => self.open_dialog(Dialog::Project(dir)),
+            Action::FindProjects => self.finder.search(),
+            Action::Ignore(root, ignore) => match projects::set_ignored(&root, ignore) {
+                Ok(list) => {
+                    self.ignored = list;
+                    let at = contract(&root);
+                    let msg = if ignore { format!("Ignoring {at} from now on") } else { format!("Listing {at} again") };
+                    self.notify(msg, false);
+                }
+                Err(e) => self.notify(e, true),
+            },
             Action::Search(query) => {
                 self.remote.found = None;
                 self.skills_sh.send(Request::Search(query.clone()));
@@ -379,10 +419,12 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // Room for the scroll bar.
                 ui.set_width(ui.available_width() - 10.0);
-                let found = if self.query.trim().is_empty() && self.filter.is_none() {
+                let found = if self.tab == Tab::Projects {
+                    self.projects(ui, config)
+                } else if self.query.trim().is_empty() && self.filter.is_none() {
                     match self.tab {
                         Tab::Fix => self.list(ui, config, &scan.report),
-                        Tab::All => self.library(ui, config, &scan.report),
+                        Tab::All | Tab::Projects => self.library(ui, config, &scan.report),
                     }
                 } else {
                     self.results(ui, config, &scan.report)
@@ -416,11 +458,13 @@ impl App {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(id));
         }
-        let clearable = !self.query.is_empty() || self.filter.is_some();
+        let in_projects = self.tab == Tab::Projects;
+        let clearable = !self.query.is_empty() || (self.filter.is_some() && !in_projects);
         let right = if clearable { 38 } else { 10 };
-        let hint = match &self.filter {
-            Some(f) => format!("Search the skills from {f}"),
-            None => format!("Search {count} skills"),
+        let hint = match (&self.filter, in_projects) {
+            (_, true) => "Search the projects and their skills".to_string(),
+            (Some(f), false) => format!("Search the skills from {f}"),
+            (None, false) => format!("Search {count} skills"),
         };
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
@@ -435,7 +479,9 @@ impl App {
         }
         let query = self.query.trim();
         let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let search = (entered && query.chars().count() >= 2).then(|| Action::Search(query.to_string()));
+        // Projects' skills are searched only here, not on skills.sh.
+        let search =
+            (entered && !in_projects && query.chars().count() >= 2).then(|| Action::Search(query.to_string()));
         if clearable {
             let centre = Pos2::new(response.rect.right() - 19.0, response.rect.center().y);
             let rect = Rect::from_center_size(centre, Vec2::splat(24.0));
@@ -756,6 +802,16 @@ impl App {
                 let from = format!("{} \u{b7} {} installs", hit.source, skills_sh::count(hit.installs));
                 (hit.name.clone(), from, Some(("Open on skills.sh", PathBuf::from(hit.page()))))
             }
+            Dialog::Project(dir) => {
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                // `project/.claude/skills/name`
+                let project = dir.ancestors().nth(3).and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned());
+                let from = match project {
+                    Some(p) => format!("{p} \u{b7} {}", contract(dir)),
+                    None => contract(dir),
+                };
+                (name, from, Some(("Open folder", dir.clone())))
+            }
         };
         let screen = ctx.content_rect();
         let width = (screen.width() - 64.0).min(760.0);
@@ -829,6 +885,12 @@ impl App {
                     None => ("This skill has no readable SKILL.md.".into(), true, None),
                 }
             }
+            Dialog::Project(dir) => {
+                match self.project_texts.entry(dir.clone()).or_insert_with(|| status::skill_text(dir)).clone() {
+                    Some(text) => (text, false, None),
+                    None => ("This skill has no readable SKILL.md.".into(), true, None),
+                }
+            }
             Dialog::Remote(hit) => match self.remote.files.get(&hit.id) {
                 None => ("Fetching it from skills.sh\u{2026}".into(), true, None),
                 Some(Err(e)) => (format!("Couldn't fetch it: {e}"), true, None),
@@ -852,15 +914,24 @@ impl App {
         let fixes = report.problems.len();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let projects = match &self.finder.found {
+                Some(found) => format!("Projects \u{b7} {}", found.iter().filter(|p| !self.is_ignored(&p.root)).count()),
+                None => "Projects".to_string(),
+            };
             let tabs = [
                 (Tab::Fix, format!("To fix \u{b7} {fixes}")),
                 (Tab::All, format!("All skills \u{b7} {}", report.skills.len())),
+                (Tab::Projects, projects),
             ];
             for (tab, label) in tabs {
                 let selected = self.tab == tab;
                 let colour = if selected { colours().text_strong } else { colours().text_weak };
                 if ui.selectable_label(selected, RichText::new(label).font(theme::strong(13.0)).color(colour)).clicked() {
                     self.tab = tab;
+                    // Looked for when first wanted, since it can take a while.
+                    if tab == Tab::Projects && self.finder.found.is_none() {
+                        self.finder.search();
+                    }
                 }
             }
         });
@@ -1006,6 +1077,253 @@ impl App {
             })
             .response;
         self.backdrop(ui, backdrop, response.rect, &k, viewing);
+        action
+    }
+
+    fn is_ignored(&self, root: &Path) -> bool {
+        self.ignored.iter().any(|p| normalize(p) == normalize(root))
+    }
+
+    /// The projects on this computer with skills of their own, each opening to
+    /// list them, to read but not change. The source and the targets are left
+    /// out, being Skillster's own. Searching keeps the projects whose path has
+    /// every word searched for, and the skills whose name or description does,
+    /// opening the projects that have any. Ignored projects are listed last,
+    /// folded away, to list them again.
+    fn projects(&mut self, ui: &mut egui::Ui, config: &Config) -> Option<Action> {
+        let c = colours();
+        let weak = |ui: &mut egui::Ui, text: &str| {
+            ui.label(RichText::new(text).color(c.text_weak));
+        };
+        let Some(found) = self.finder.found.take() else {
+            group_heading(ui, "Projects with skills", "");
+            ui.add_space(4.0);
+            weak(ui, "Looking for projects with skills of their own\u{2026}");
+            return None;
+        };
+        let synced: Vec<String> = std::iter::once(&config.source).chain(&config.targets).map(|p| normalize(p)).collect();
+        let terms: Vec<String> = self.query.to_lowercase().split_whitespace().map(String::from).collect();
+        let mut listed = 0;
+        let mut shown: Vec<(&Project, Vec<Shown>)> = Vec::new();
+        for project in &found {
+            if self.is_ignored(&project.root) {
+                continue;
+            }
+            let path_matches = {
+                // Either slash finds a path.
+                let hay = normalize(&project.root).replace('\\', "/");
+                terms.iter().all(|t| hay.contains(&t.replace('\\', "/")))
+            };
+            let skills: Vec<Shown> = project
+                .skills
+                .iter()
+                .map(|s| (s, s.folders.iter().filter(|f| !synced.contains(&normalize(f))).collect::<Vec<_>>()))
+                .filter(|(_, folders)| !folders.is_empty())
+                .collect();
+            if skills.is_empty() {
+                continue;
+            }
+            listed += 1;
+            let matching: Vec<Shown> = skills
+                .into_iter()
+                .filter(|(s, _)| {
+                    let hay = format!("{} {}", s.name, s.description.as_deref().unwrap_or_default()).to_lowercase();
+                    path_matches || terms.iter().all(|t| hay.contains(t.as_str()))
+                })
+                .collect();
+            if !matching.is_empty() {
+                shown.push((project, matching));
+            }
+        }
+        let count = match (listed, terms.is_empty()) {
+            (1, true) => "1 project".to_string(),
+            (n, true) => format!("{n} projects"),
+            (n, false) => format!("{} of {n}", shown.len()),
+        };
+        group_heading(ui, "Projects with skills", &count);
+        let mut action = None;
+        ui.horizontal(|ui| {
+            let note = "Projects with a skills folder of their own, such as .claude/skills. Here only to read.";
+            ui.label(RichText::new(note).small().color(c.text_weak));
+            if self.finder.searching {
+                ui.add_enabled(false, egui::Button::new(RichText::new("Looking\u{2026}").small()));
+            } else if ui.small_button("Look again").on_hover_text("Look for projects again").clicked() {
+                action = Some(Action::FindProjects);
+            }
+        });
+        ui.add_space(4.0);
+        if shown.is_empty() {
+            let query = self.query.trim();
+            let text = if !terms.is_empty() {
+                format!("No project or skill matches \u{201c}{query}\u{201d}.")
+            } else if found.is_empty() {
+                "No project on this computer has skills of its own.".to_string()
+            } else {
+                "Every project found is ignored.".to_string()
+            };
+            weak(ui, &text);
+        }
+        for (project, skills) in &shown {
+            if let Some(a) = self.project_row(ui, project, skills, !terms.is_empty()) {
+                action = Some(a);
+            }
+        }
+        if let Some(a) = self.ignored_projects(ui) {
+            action = Some(a);
+        }
+        self.finder.found = Some(found);
+        action
+    }
+
+    /// A project: a row with its name, path and how many skills it has, which
+    /// opens and closes its list of skills, and the icon that ignores it. Open
+    /// while `searching`.
+    fn project_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &Project,
+        skills: &[Shown],
+        searching: bool,
+    ) -> Option<Action> {
+        let c = colours();
+        let k = project_key(&project.root);
+        let open = searching || self.open.contains(&k);
+        let mut body = CollapsingState::load_with_default_open(ui.ctx(), Id::unique(("project-body", &k)), false);
+        body.set_open(open);
+        let openness = body.openness(ui.ctx());
+        let mut action = None;
+        let backdrop = ui.painter().add(Shape::Noop);
+        let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 46.0));
+        // First, so the ignore icon drawn over it takes its own clicks.
+        let response = ui.allocate_rect(rect, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let name = project.name();
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+        let mut row = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
+        row.add_space(6.0);
+        chevron(&mut row, openness, c.text_weak);
+        row.add_space(4.0);
+        // The skills folders the shown skills are in (`.agents/skills`), said once
+        // here; a skill not in all of them says which it is in.
+        let mut all: Vec<&PathBuf> = skills.iter().flat_map(|(_, f)| f.iter().copied()).collect();
+        all.sort_by_key(|f| normalize(f));
+        all.dedup_by_key(|f| normalize(f));
+        let within = |folders: &[&PathBuf], whole: bool| {
+            let name = |f: &&PathBuf| {
+                let f = if whole { f.strip_prefix(&project.root).ok()? } else { f.parent()?.file_name()?.as_ref() };
+                Some(f.to_string_lossy().replace('\\', "/"))
+            };
+            folders.iter().filter_map(name).collect::<Vec<_>>().join(", ")
+        };
+        let mut ignore = false;
+        row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(6.0);
+            let (icon, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+            let label = format!("Ignore {name}");
+            if ignore_button(ui, icon, &k, &label, "Ignore this project: it won't be listed from now on").clicked() {
+                ignore = true;
+            }
+            ui.add_space(4.0);
+            let n = skills.len();
+            ui.label(RichText::new(format!("{n} {}", if n == 1 { "skill" } else { "skills" })).small().color(c.text_weak));
+            ui.add_space(8.0);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(egui::Label::new(RichText::new(project.name()).color(c.text)).truncate().selectable(false));
+                let at = format!("{} \u{b7} {}", contract(&project.root), within(&all, true));
+                let at = RichText::new(at).small().color(c.text_weak);
+                ui.add(egui::Label::new(at).truncate().selectable(false));
+            });
+        });
+        if ignore {
+            action = Some(Action::Ignore(project.root.clone(), true));
+        } else if response.clicked() && !searching {
+            action = Some(Action::Toggle(k.clone()));
+        }
+        self.backdrop(ui, backdrop, rect, &k, false);
+        body.show_body_unindented(ui, |ui| {
+            ui.set_opacity(openness);
+            for (skill, folders) in skills {
+                let only = (folders.len() < all.len()).then(|| format!("only in {}", within(folders, false)));
+                if let Some(a) = self.project_skill(ui, &folders[0].join(&skill.name), skill, only.as_deref()) {
+                    action = Some(a);
+                }
+            }
+            ui.add_space(6.0);
+        });
+        action
+    }
+
+    /// One of a project's skills: its name and description, which of the
+    /// project's skills folders it is in if `only` says, and View.
+    fn project_skill(&self, ui: &mut egui::Ui, dir: &Path, skill: &Skill, only: Option<&str>) -> Option<Action> {
+        let c = colours();
+        let k = project_skill_key(dir);
+        let viewing = self.viewing().as_ref() == Some(&k);
+        let mut action = None;
+        let backdrop = ui.painter().add(Shape::Noop);
+        let response = ui
+            .horizontal(|ui| {
+                ui.set_min_height(40.0);
+                ui.add_space(30.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    if ui.button("View").clicked() {
+                        action = Some(Action::ViewProject(dir.to_path_buf()));
+                    }
+                    if let Some(only) = only {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(only).small().color(c.text_weak));
+                        ui.add_space(4.0);
+                    }
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.add(egui::Label::new(RichText::new(&skill.name).color(c.text)).truncate());
+                        if let Some(d) = &skill.description {
+                            ui.add(egui::Label::new(RichText::new(d).small().color(c.text_weak)).truncate());
+                        }
+                    });
+                });
+            })
+            .response;
+        self.backdrop(ui, backdrop, response.rect, &k, viewing);
+        action
+    }
+
+    /// The ignored projects, folded away under a heading, each with a way to
+    /// list it again.
+    fn ignored_projects(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        if self.ignored.is_empty() {
+            return None;
+        }
+        let c = colours();
+        let mut action = None;
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            let title = format!("Ignored \u{b7} {}", self.ignored.len());
+            ui.label(RichText::new(title).font(theme::strong(12.5)).color(c.text_weak));
+            if ui.small_button(if self.show_ignored { "Hide" } else { "Show" }).clicked() {
+                self.show_ignored = !self.show_ignored;
+            }
+        });
+        if self.show_ignored {
+            for root in &self.ignored {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(30.0);
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(6.0);
+                        if ui.small_button("List again").clicked() {
+                            action = Some(Action::Ignore(root.clone(), false));
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(contract(root)).color(c.text_weak)).truncate());
+                        });
+                    });
+                });
+            }
+        }
         action
     }
 
@@ -1355,6 +1673,60 @@ fn view_key(skill: &str) -> String {
 
 fn remote_key(id: &str) -> String {
     format!("remote|{id}")
+}
+
+/// A project's skill and those of its skills folders listed, which leave out the
+/// source and the targets.
+type Shown<'a> = (&'a Skill, Vec<&'a PathBuf>);
+
+fn project_key(root: &Path) -> String {
+    format!("project|{}", normalize(root))
+}
+
+fn project_skill_key(dir: &Path) -> String {
+    format!("project-skill|{}", normalize(dir))
+}
+
+/// The icon button that ignores a project, over `rect`: an eye struck through,
+/// faint until hovered. Screen readers call it `label`.
+fn ignore_button(ui: &mut egui::Ui, rect: Rect, id: &str, label: &str, hint: &str) -> egui::Response {
+    let c = colours();
+    let response = ui.interact(rect, Id::unique(("ignore", id)), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
+    let hovered = response.hovered() || response.has_focus();
+    let painter = ui.painter();
+    let centre = rect.center();
+    if hovered {
+        painter.circle_filled(centre, 12.0, c.button_hovered.0);
+    }
+    let stroke = Stroke::new(1.3, if hovered { c.text_strong } else { c.text_weak });
+    // The eye: two arcs meeting at its corners.
+    let (w, h) = (6.5, 4.0);
+    const STEPS: usize = 12;
+    let mut outline = Vec::with_capacity(2 * STEPS);
+    for i in 0..=STEPS {
+        let t = -1.0 + 2.0 * i as f32 / STEPS as f32;
+        outline.push(centre + Vec2::new(t * w, -h * (1.0 - t * t)));
+    }
+    for i in 1..STEPS {
+        let t = 1.0 - 2.0 * i as f32 / STEPS as f32;
+        outline.push(centre + Vec2::new(t * w, h * (1.0 - t * t)));
+    }
+    painter.add(Shape::closed_line(outline, stroke));
+    painter.circle_stroke(centre, 1.6, stroke);
+    painter.line_segment([centre + Vec2::new(-6.0, -6.0), centre + Vec2::new(6.0, 6.0)], stroke);
+    response
+}
+
+/// A chevron pointing right, turning down as `openness` goes from 0 to 1.
+fn chevron(ui: &mut egui::Ui, openness: f32, colour: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    let angle = openness * std::f32::consts::FRAC_PI_2;
+    let rot = egui::emath::Rot2::from_angle(angle);
+    let centre = rect.center();
+    let points = [Vec2::new(-1.75, -3.5), Vec2::new(1.75, 0.0), Vec2::new(-1.75, 3.5)].map(|p| centre + rot * p);
+    ui.painter().add(Shape::line(points.to_vec(), Stroke::new(1.4, colour)));
 }
 
 /// The dialog's text, scrolling in an inset panel `height` tall, with a dark

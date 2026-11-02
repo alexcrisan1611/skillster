@@ -1,4 +1,5 @@
-//! Finding the `skills` folders worth offering in the installer.
+//! Finding the `skills` folders worth offering in the installer, and the
+//! projects with skills of their own, for the window.
 //!
 //! Searching turns up hundreds of folders named `skills`; most are copies some tool
 //! manages (plugin caches, editor extensions, Python packages, temp files, worktrees,
@@ -47,19 +48,49 @@ const MAX_TOOL_DEPTH_EMPTY: usize = 1;
 /// elsewhere it walks the home folder.
 pub fn skills_folders() -> Vec<Found> {
     let places = Places::here();
+    let raw = search(&places.home, true);
+    places.offer(raw)
+}
+
+/// A project that keeps skills of its own (`app/.claude/skills`), and its folders
+/// of them.
+pub struct Project {
+    pub root: PathBuf,
+    /// Its skills folders (`.claude/skills`, `.agents/skills`...), by path.
+    pub folders: Vec<PathBuf>,
+}
+
+/// The projects on this computer with skills of their own, by path. The same
+/// folders as the installer looks through, with the same left out: plugin and
+/// marketplace caches, extensions, packages, temp folders, backups, worktrees,
+/// and anything inside a tool's own folder.
+pub fn projects() -> Vec<Project> {
+    let places = Places::here();
+    let raw = search(&places.home, false);
+    places.projects(raw)
+}
+
+/// Every folder named `skills`: from Everything on Windows when it runs, else by
+/// walking the home folder. `say` prints what it is doing, for the installer.
+fn search(home: &Path, say: bool) -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        println!("Searching for skills folders with Everything...");
+        if say {
+            println!("Searching for skills folders with Everything...");
+        }
         match crate::everything::skills_folders() {
-            Ok(raw) => return places.offer(raw),
-            Err(e) => println!("{e} Searching your home folder instead, which is slower..."),
+            Ok(raw) => return raw,
+            Err(e) if say => println!("{e} Searching your home folder instead, which is slower..."),
+            Err(_) => {}
         }
     }
     #[cfg(not(windows))]
-    println!("Searching your home folder for skills folders...");
+    if say {
+        println!("Searching your home folder for skills folders...");
+    }
     let mut raw = Vec::new();
-    walk(&places.home, 0, &mut raw);
-    places.offer(raw)
+    walk(home, 0, &mut raw);
+    raw
 }
 
 /// Subfolders of `dir` that contain a `SKILL.md`.
@@ -118,6 +149,46 @@ impl Places {
         let keys: Vec<String> = found.iter().map(|f| normalize(&f.path)).collect();
         found.retain(|f| !keys.iter().any(|k| below(&f.path, k).is_some()));
         found
+    }
+
+    /// The projects among `raw` that hold skills, sorted by path, each with its
+    /// skills folders; folders inside another one found are left out.
+    fn projects(&self, raw: Vec<PathBuf>) -> Vec<Project> {
+        let mut folders: Vec<(PathBuf, PathBuf)> = raw
+            .into_iter()
+            .filter_map(|path| Some((self.project_root(&path)?, path)))
+            .filter(|(_, path)| skill_count(path) > 0)
+            .collect();
+        folders.sort_by_key(|(_, path)| normalize(path));
+        folders.dedup_by_key(|(_, path)| normalize(path));
+        let keys: Vec<String> = folders.iter().map(|(_, path)| normalize(path)).collect();
+        folders.retain(|(_, path)| !keys.iter().any(|k| below(path, k).is_some()));
+        let mut projects: Vec<Project> = Vec::new();
+        for (root, path) in folders {
+            match projects.iter_mut().find(|p| normalize(&p.root) == normalize(&root)) {
+                Some(p) => p.folders.push(path),
+                None => projects.push(Project { root, folders: vec![path] }),
+            }
+        }
+        projects.sort_by_key(|p| normalize(&p.root));
+        projects
+    }
+
+    /// The project a `skills` folder belongs to: `app` for `app/.claude/skills`.
+    /// `None` for one that isn't in a dot-folder, the home folder's own (a tool's),
+    /// or one under junk, an app-data folder or another dot-folder.
+    fn project_root(&self, path: &Path) -> Option<PathBuf> {
+        let dot = path.parent()?;
+        if !dot.file_name()?.to_string_lossy().starts_with('.') {
+            return None;
+        }
+        let root = dot.parent()?;
+        let parts = below(root, "")?;
+        if parts.iter().any(|c| is_junk(c) || c.starts_with('.')) || normalize(root) == normalize(&self.home) {
+            return None;
+        }
+        let in_app_data = self.app_roots.iter().any(|r| below(root, &normalize(r)).is_some());
+        (!in_app_data).then(|| root.to_path_buf())
     }
 
     /// `Some(true)` for a tool's own skills folder, `Some(false)` for a standalone
