@@ -223,20 +223,24 @@ fn compare(source: &Path, copy: &Path) -> io::Result<Diff> {
 }
 
 /// Every file under `root`, keyed by its path relative to it with `/` separators.
+/// Links to folders are not entered (one pointing back up would never end), and
+/// links to nothing are left out; links to files count as the file.
 fn files(root: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
+    if fs::metadata(root)?.is_file() {
+        out.insert(String::new(), root.to_path_buf());
+        return Ok(out);
+    }
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
-        if fs::metadata(&dir)?.is_file() {
-            out.insert(prefix, dir);
-            continue;
-        }
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let rel = format!("{prefix}{}", entry.file_name().to_string_lossy());
-            if entry.path().is_dir() {
+            // `file_type` does not follow links.
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
                 stack.push((entry.path(), rel + "/"));
-            } else {
+            } else if kind.is_file() || entry.path().is_file() {
                 out.insert(rel, entry.path());
             }
         }
@@ -286,7 +290,7 @@ pub fn fix(source: &Path, problem: &Problem, backup: &Path) -> Result<String, St
             if fs::symlink_metadata(&src).is_ok() {
                 return Err(format!("{} is already in the source", problem.skill));
             }
-            fs::rename(&dest, &src).map_err(|e| format!("cannot move {shown} to {}: {e}", src.display()))?;
+            move_dir(&dest, &src)?;
             link(&src, &dest)?;
             for target in same {
                 back_up(backup, target, &problem.skill)?;
@@ -306,8 +310,47 @@ fn back_up(backup: &Path, target: &Path, skill: &str) -> Result<PathBuf, String>
     if let Some(dir) = to.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    fs::rename(&from, &to).map_err(|e| format!("cannot move {} to {}: {e}", from.display(), to.display()))?;
+    move_dir(&from, &to)?;
     Ok(to)
+}
+
+/// Moves the folder `from` to `to`, which may be on another drive: there it is
+/// copied into a hidden folder beside `to` (which the background process ignores),
+/// renamed into place once complete, and only then removed from `from`.
+fn move_dir(from: &Path, to: &Path) -> Result<(), String> {
+    let failed = |e: io::Error| format!("cannot move {} to {}: {e}", from.display(), to.display());
+    match fs::rename(from, to) {
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
+        done => return done.map_err(failed),
+    }
+    let name = to.file_name().map_or_else(Default::default, |n| n.to_string_lossy().into_owned());
+    let partial = to.with_file_name(format!(".skillster-moving-{name}"));
+    let _ = fs::remove_dir_all(&partial);
+    if let Err(e) = copy_tree(from, &partial).and_then(|()| fs::rename(&partial, to)) {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(failed(e));
+    }
+    fs::remove_dir_all(from)
+        .map_err(|e| format!("copied {} to {} but cannot remove it: {e}", from.display(), to.display()))
+}
+
+/// Copies the folder `from` to `to`. Links inside are made again as links, not
+/// followed, except links to files, which are copied as the file.
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let (path, dest) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&path, &dest)?;
+        } else if kind.is_file() || path.is_file() {
+            fs::copy(&path, &dest)?;
+        } else if let Some(t) = link_target(&path) {
+            create_link(&t, &dest)?;
+        }
+    }
+    Ok(())
 }
 
 fn link(src: &Path, dest: &Path) -> Result<(), String> {

@@ -31,8 +31,11 @@ ureq = { version = "3.5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.1.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_SystemInformation"] }
 raw-window-handle = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 
 # Loads the Wayland libraries when the window opens, rather than needing them to build.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

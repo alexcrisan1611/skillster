@@ -68,7 +68,7 @@ debounce_ms = 500
 
 [log]
 path      = "~/.local/state/skillster/skillster.log"   # default depends on the OS, see above
-max_bytes = 1048576                                         # the log is reset past this size
+max_bytes = 1048576                                         # past this size the log moves to <name>.1 and a new one starts
 ```
 
 Dropping a target, or changing the source, leaves the links already made in place.

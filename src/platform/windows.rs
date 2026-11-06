@@ -181,6 +181,18 @@ pub fn open(p: &Path) {
     let _ = Command::new("explorer").arg(p).spawn();
 }
 
+/// The local date and time, as `2026-11-06 14:03:22`.
+pub fn local_time() -> String {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: GetLocalTime fills in the SYSTEMTIME it is given and cannot fail.
+    let t = unsafe {
+        let mut t = std::mem::zeroed();
+        GetLocalTime(&mut t);
+        t
+    };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
+}
+
 /// Whether Windows is set to show fewer animations ("Animation effects" off).
 pub fn reduced_motion() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW};

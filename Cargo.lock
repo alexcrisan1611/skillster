@@ -2830,6 +2830,7 @@ dependencies = [
  "eframe",
  "embed-resource",
  "junction",
+ "libc",
  "notify",
  "raw-window-handle",
  "serde",

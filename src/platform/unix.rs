@@ -329,6 +329,19 @@ pub fn open(p: &Path) {
     let _ = Command::new(opener).arg(p).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
+/// The local date and time, as `2026-11-06 14:03:22`.
+pub fn local_time() -> String {
+    // SAFETY: `time` accepts a null pointer, and `localtime_r` writes only to the
+    // `tm` it is given, which is plain data that may start zeroed.
+    let t = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut t: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut t);
+        t
+    };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
+}
+
 /// Not asked of the system here; the window's animations are short either way.
 pub fn reduced_motion() -> bool {
     false

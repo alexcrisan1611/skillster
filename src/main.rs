@@ -80,7 +80,7 @@ fn show_config(path: &std::path::Path) -> Result<(), String> {
     }
     println!("rescan:   {} s", c.rescan.as_secs());
     println!("debounce: {} ms", c.debounce.as_millis());
-    println!("log:      {} (reset past {} bytes)", c.log_path.display(), c.log_max_bytes);
+    println!("log:      {} (kept as the previous log past {} bytes)", c.log_path.display(), c.log_max_bytes);
     Ok(())
 }
 
