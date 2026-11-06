@@ -20,6 +20,8 @@ Copies are never deleted: they are moved into a `backups` folder next to the log
 
 The search box (Ctrl+F) finds your skills by name or description, to read one's `SKILL.md` or delete it (it goes to `backups`, and its links go from every tool). It searches [skills.sh](https://skills.sh) at the same time: **Install** puts a skill from there into the source, and every tool gets it. The window also says whether background sync is running, and can start it.
 
+**All skills** lists every skill in the source, where it came from and how often skills.sh says it has been installed. **Check for updates** compares the ones that came from skills.sh with their versions there, ignoring line endings. **Review** shows what changed, file by file, and **Update** (or **Update all**) puts the new version in place, moving yours to `backups` first. skills.sh serves only text files, so images and other files it doesn't serve are kept. A skill in the source that is itself a link is left to be updated where it lives.
+
 **Projects** lists the projects on your computer with skills of their own (`app/.claude/skills`, `app/.agents/skills`...), found the way the installer finds folders and with the same ones left out (caches, extensions, packages, temp folders, backups, worktrees, tools' own folders). Click a project to see its skills and read any of them; nothing there can be changed. The eye icon ignores a project from then on; ignored projects are listed at the end, to list again.
 
 <p align="center"><img src="assets/screenshot.png" width="640" alt="The Skillster window listing links to fix"></p>

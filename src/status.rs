@@ -406,6 +406,36 @@ pub fn remove(config: &Config, skill: &str, backup: &Path) -> Result<String, Str
     Ok(format!("Deleted {skill}; it is in {}", to.display()))
 }
 
+/// Puts the complete folder `new`, a hidden one in the source, in place of the
+/// source's `skill`, and moves the old one into `backup`, returning where it went.
+/// The links to the skill keep working: they point at its path, which is empty
+/// only between two renames.
+pub fn replace(source: &Path, skill: &str, new: &Path, backup: &Path) -> Result<PathBuf, String> {
+    let dest = source.join(skill);
+    let old = source.join(format!(".skillster-old-{skill}"));
+    let to = backup_path(backup, source, skill);
+    if let Some(dir) = to.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    // Left by a replace that stopped halfway; it is the user's, so it is kept too.
+    if fs::symlink_metadata(&old).is_ok() {
+        move_dir(&old, &backup_path(backup, source, &format!("{skill}-earlier")))?;
+    }
+    fs::rename(&dest, &old).map_err(|e| format!("cannot move {} aside: {e}", dest.display()))?;
+    if let Err(e) = fs::rename(new, &dest) {
+        let _ = fs::rename(&old, &dest);
+        return Err(format!("cannot put the new {skill} in place: {e}"));
+    }
+    move_dir(&old, &to)?;
+    Ok(to)
+}
+
+/// Every file of a skill, keyed by its path relative to the skill's folder with
+/// `/` separators; links to folders are not entered.
+pub fn skill_files(dir: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
+    files(dir)
+}
+
 /// `<backup>/<unix seconds>/<target, as one folder name>/<skill>`, so nothing
 /// backed up is ever overwritten.
 fn backup_path(backup: &Path, target: &Path, skill: &str) -> PathBuf {

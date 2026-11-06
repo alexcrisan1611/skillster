@@ -11,11 +11,13 @@ use std::time::Duration;
 
 use eframe::egui;
 use serde::Deserialize;
+use skillster::config::contract;
+use skillster::status;
 
 const BASE: &str = "https://skills.sh";
 /// As many results as `skills find` shows.
 const LIMIT: &str = "20";
-const TIMEOUT: Duration = Duration::from_secs(20);
+pub const TIMEOUT: Duration = Duration::from_secs(20);
 /// Largest reply read; a skill's files all come in one.
 const MAX_REPLY: u64 = 32 * 1024 * 1024;
 
@@ -174,7 +176,7 @@ fn search(agent: &ureq::Agent, query: &str) -> Result<Vec<Hit>, String> {
     Ok(hits)
 }
 
-fn download(agent: &ureq::Agent, hit: &Hit) -> Result<Vec<File>, String> {
+pub fn download(agent: &ureq::Agent, hit: &Hit) -> Result<Vec<File>, String> {
     let skill = &hit.skill_id;
     match hit.origin()? {
         Origin::Repo { owner, repo } => {
@@ -213,12 +215,50 @@ pub fn skill_md(files: &[File]) -> Option<&str> {
 /// the background process ignores, then renamed into place, so it only ever
 /// links a complete skill.
 pub fn install(source: &Path, name: &str, files: &[File]) -> Result<String, String> {
+    let dest = source.join(name);
+    if safe_name(name) && fs::symlink_metadata(&dest).is_ok() {
+        return Err(format!("{name} is already in your skills"));
+    }
+    let tmp = write_hidden(source, name, files)?;
+    if let Err(e) = fs::rename(&tmp, &dest) {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("cannot install {name}: {e}"));
+    }
+    Ok(format!("Installed {name}"))
+}
+
+/// Puts a newer version of the source's `name` in place: written into a hidden
+/// folder first, with the old version's `keep` files (relative paths) copied in,
+/// then swapped in, with the old one moved into `backup`.
+pub fn update(source: &Path, name: &str, files: &[File], keep: &[String], backup: &Path) -> Result<String, String> {
+    let tmp = write_hidden(source, name, files)?;
+    let carry = || -> io::Result<()> {
+        for rel in keep.iter().filter(|rel| safe_path(rel)) {
+            let to = tmp.join(rel);
+            if let Some(dir) = to.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::copy(source.join(name).join(rel), to)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = carry() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("cannot keep {name}'s other files: {e}"));
+    }
+    match status::replace(source, name, &tmp, backup) {
+        Ok(to) => Ok(format!("Updated {name}; the old one is in {}", contract(&to))),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Writes a skill's files into `source/.skillster-install-<name>`, returning it.
+fn write_hidden(source: &Path, name: &str, files: &[File]) -> Result<PathBuf, String> {
     if !safe_name(name) {
         return Err(format!("odd skill name {name}"));
-    }
-    let dest = source.join(name);
-    if fs::symlink_metadata(&dest).is_ok() {
-        return Err(format!("{name} is already in your skills"));
     }
     // As the `skills` CLI installs them: without its metadata or version-control folders.
     let files: Vec<&File> = files.iter().filter(|f| installable(&f.path)).collect();
@@ -238,13 +278,13 @@ pub fn install(source: &Path, name: &str, files: &[File]) -> Result<String, Stri
             }
             fs::write(path, &f.contents)?;
         }
-        fs::rename(&tmp, &dest)
+        Ok(())
     };
     if let Err(e) = write() {
         let _ = fs::remove_dir_all(&tmp);
-        return Err(format!("cannot install {name}: {e}"));
+        return Err(format!("cannot write {name}: {e}"));
     }
-    Ok(format!("Installed {name}"))
+    Ok(tmp)
 }
 
 fn safe_name(s: &str) -> bool {
@@ -263,13 +303,15 @@ fn safe_domain(s: &str) -> bool {
 }
 
 /// A relative path that stays inside the skill folder on every OS.
-fn safe_path(path: &str) -> bool {
+pub fn safe_path(path: &str) -> bool {
     path.split('/').all(|part| {
         !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']) && !part.chars().any(char::is_control)
     })
 }
 
-fn installable(path: &str) -> bool {
+/// Whether the `skills` CLI would install this file: not its metadata, nor a
+/// version-control or cache folder.
+pub fn installable(path: &str) -> bool {
     let mut parts: Vec<&str> = path.split('/').collect();
     let file = parts.pop().unwrap_or_default();
     file != "metadata.json" && parts.iter().all(|p| !matches!(*p, ".git" | "__pycache__" | "__pypackages__"))

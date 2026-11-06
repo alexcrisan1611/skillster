@@ -11,6 +11,7 @@ mod projects;
 mod skills_sh;
 mod sources;
 mod theme;
+mod updates;
 mod watch;
 mod window;
 

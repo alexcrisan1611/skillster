@@ -22,6 +22,7 @@ use crate::library::{self, Installs};
 use crate::projects::{self, Finder, Project, Skill};
 use crate::sources;
 use crate::theme::{self, colours};
+use crate::updates::{self, Changes, State, Updates};
 use crate::watch::{Scan, Scanner};
 use crate::window;
 
@@ -94,6 +95,8 @@ pub struct App {
     /// Projects' skills' `SKILL.md`, by folder, read when first viewed; cleared
     /// whenever the projects are looked for again.
     project_texts: HashMap<PathBuf, Option<String>>,
+    /// Newer versions on skills.sh of the source's skills, once asked.
+    updates: Updates,
 }
 
 /// The two sections of the list.
@@ -169,6 +172,10 @@ enum Action {
     Ignore(PathBuf, bool),
     /// Looks for projects again.
     FindProjects,
+    /// Asks skills.sh whether the source's skills from it have newer versions.
+    CheckUpdates,
+    /// Puts skills.sh's newer version of these skills in place.
+    Update(Vec<String>),
 }
 
 /// Identifies a problem across scans.
@@ -219,6 +226,7 @@ impl App {
             ignored: projects::ignored(),
             show_ignored: false,
             project_texts: HashMap::new(),
+            updates: Updates::spawn(cc.egui_ctx.clone()),
         }
     }
 
@@ -242,6 +250,18 @@ impl App {
     fn take_replies(&mut self) {
         if self.finder.take() {
             self.project_texts.clear();
+        }
+        let updated = self.updates.take();
+        let failed = updated.iter().filter(|(_, r)| r.is_err()).count();
+        for (name, result) in updated {
+            self.open.remove(&update_key(&name));
+            self.texts.remove(&name);
+            match result {
+                Ok(msg) if failed == 0 => self.notify(msg, false),
+                Ok(_) => {}
+                Err(e) => self.notify(format!("Couldn't update {name}: {e}"), true),
+            }
+            self.scanner.refresh();
         }
         while let Ok(reply) = self.skills_sh.replies.try_recv() {
             match reply {
@@ -324,6 +344,7 @@ impl App {
                 match status::remove(&config, &skill, &platform::backups_dir()) {
                     Ok(msg) => {
                         let _ = sources::forget(&skill);
+                        self.updates.forget(&skill);
                         if matches!(&self.dialog, Some(Dialog::Local(n)) if *n == skill) {
                             self.dialog_open = false;
                         }
@@ -333,6 +354,26 @@ impl App {
                     Err(e) => self.notify(e, true),
                 }
                 self.scanner.refresh();
+            }
+            Action::CheckUpdates => {
+                let Some(Ok(config)) = self.scan.as_ref().map(|s| &s.config) else { return };
+                let skills = self.scan.as_ref().map(|s| s.report.skills.clone()).unwrap_or_default();
+                let skills: Vec<(String, String)> = skills
+                    .into_iter()
+                    .filter_map(|name| {
+                        let source = self.sources.get(&name)?.clone();
+                        updates::checkable(&source, &name).then_some((name, source))
+                    })
+                    .collect();
+                let source = config.source.clone();
+                self.updates.check(skills, &source);
+            }
+            Action::Update(names) => {
+                let Some(Ok(config)) = self.scan.as_ref().map(|s| &s.config) else { return };
+                let source = config.source.clone();
+                for name in names {
+                    self.updates.update(&name, &source);
+                }
             }
             Action::StartDaemon => match self.start_daemon() {
                 Ok(()) => self.notify("Started background sync".into(), false),
@@ -974,11 +1015,15 @@ impl App {
                 ui.label(RichText::new("Sort by").small().color(c.text_weak));
             });
         });
+        let checkable = rows.iter().filter(|r| r.2.as_deref().is_some_and(|s| updates::checkable(s, &r.0))).count();
         ui.horizontal(|ui| {
             let note = format!("{known} of {} have a known source.", rows.len());
             ui.label(RichText::new(note).small().color(c.text_weak));
             if self.counts.any_failed() && ui.small_button("Retry install counts").clicked() {
                 self.counts.retry();
+            }
+            if let Some(a) = self.update_controls(ui, checkable) {
+                action = Some(a);
             }
         });
         ui.add_space(4.0);
@@ -989,7 +1034,112 @@ impl App {
             if let Some(a) = self.library_row(ui, name, desc.as_deref(), source.as_deref(), installs.as_ref()) {
                 action = Some(a);
             }
+            let open = self.open.contains(&update_key(name));
+            if open && let Some(State::Available(changes)) = self.updates.get(name) {
+                let changes = changes.clone();
+                ui.add_space(4.0);
+                if let Some(a) = self.update_review(ui, name, &changes) {
+                    action = Some(a);
+                }
+                ui.add_space(8.0);
+            }
         }
+        action
+    }
+
+    /// Check for updates; once checked, how many there are, and Update all.
+    fn update_controls(&self, ui: &mut egui::Ui, checkable: usize) -> Option<Action> {
+        if checkable == 0 {
+            return None;
+        }
+        let c = colours();
+        let count = |want: fn(&State) -> bool| self.updates.count(want);
+        let checking = count(|s| matches!(s, State::Checking));
+        let updating = count(|s| matches!(s, State::Updating(_)));
+        let failed = count(|s| matches!(s, State::Failed(_)));
+        let current = count(|s| matches!(s, State::Current));
+        let available = self.updates.available();
+        let weak = |text: String| RichText::new(text).small().color(c.text_weak);
+        let mut action = None;
+        ui.add_space(6.0);
+        if checking > 0 {
+            ui.label(weak(format!("Checking for updates\u{2026} {checking} to go")));
+            return None;
+        }
+        if !self.updates.asked() {
+            let hint = format!("Compare the {checkable} skills that came from skills.sh with their versions there");
+            if ui.small_button("Check for updates").on_hover_text(hint).clicked() {
+                action = Some(Action::CheckUpdates);
+            }
+            return action;
+        }
+        match available.len() {
+            0 if current > 0 => {
+                ui.label(weak("No updates".into()));
+            }
+            0 => {}
+            n => {
+                ui.label(RichText::new(plural(n, "update", "updates")).small().color(c.warn));
+            }
+        }
+        if failed > 0 {
+            ui.label(weak(format!("{failed} couldn't be checked"))).on_hover_text("Hover one's row to see why");
+        }
+        if updating > 0 {
+            ui.label(weak(format!("Updating {updating}\u{2026}")));
+        }
+        let hint = "Put skills.sh's versions in place; yours are moved to backups first";
+        if available.len() > 1 && ui.small_button("Update all").on_hover_text(hint).clicked() {
+            action = Some(Action::Update(available));
+        }
+        if updating == 0 && ui.small_button("Check again").clicked() {
+            action = Some(Action::CheckUpdates);
+        }
+        action
+    }
+
+    /// The files skills.sh's newer version of `name` changes, the diff of each
+    /// changed text file, and Update.
+    fn update_review(&self, ui: &mut egui::Ui, name: &str, changes: &Changes) -> Option<Action> {
+        let c = colours();
+        let mut action = None;
+        egui::Frame::new()
+            .fill(c.code)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(12))
+            .outer_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let mono = |text: String, colour: Color32| RichText::new(text).monospace().color(colour);
+                for f in &changes.changed {
+                    ui.label(mono(format!("~ {f}"), c.warn));
+                }
+                for f in &changes.added {
+                    ui.label(mono(format!("+ {f}   new on skills.sh"), c.added));
+                }
+                for f in &changes.removed {
+                    ui.label(mono(format!("- {f}   only in yours"), c.removed));
+                }
+                if !changes.kept.is_empty() {
+                    let n = plural(changes.kept.len(), "other file", "other files");
+                    let note = format!("Your {n} (images and the like, which skills.sh doesn't serve) stay as they are.");
+                    ui.label(RichText::new(note).small().color(c.text_weak)).on_hover_text(changes.kept.join("\n"));
+                }
+                for (f, text) in &changes.diffs {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(f).font(theme::strong(12.5)).color(c.text));
+                    diff_view(ui, text, ("update-diff", name, f));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Update").clicked() {
+                        action = Some(Action::Update(vec![name.to_string()]));
+                    }
+                    let note = "Yours is moved to backups first, with any files only it has.";
+                    ui.label(RichText::new(note).small().color(c.text_weak));
+                });
+            });
         action
     }
 
@@ -1010,6 +1160,16 @@ impl App {
         if confirming {
             ui.ctx().request_repaint_after(CONFIRM);
         }
+        let reviewing = self.open.contains(&update_key(name));
+        // What the row says about a newer version on skills.sh, once asked: Some(None)
+        // for Update and Review, or a note on how the check is going.
+        let update = match self.updates.get(name) {
+            None | Some(State::Current) => None,
+            Some(State::Available(_)) => Some(None),
+            Some(State::Checking) => Some(Some(("Checking\u{2026}", String::new()))),
+            Some(State::Updating(_)) => Some(Some(("Updating\u{2026}", String::new()))),
+            Some(State::Failed(e)) => Some(Some(("Couldn't check", e.clone()))),
+        };
         let mut action = None;
         let backdrop = ui.painter().add(Shape::Noop);
         let response = ui
@@ -1028,6 +1188,24 @@ impl App {
                     }
                     if ui.button("View").clicked() {
                         action = Some(Action::View(name.to_string()));
+                    }
+                    match &update {
+                        Some(None) => {
+                            let hint = "Put skills.sh's newer version in place; yours is moved to backups first";
+                            if ui.button(RichText::new("Update").color(c.warn)).on_hover_text(hint).clicked() {
+                                action = Some(Action::Update(vec![name.to_string()]));
+                            }
+                            if ui.button(if reviewing { "Hide" } else { "Review" }).clicked() {
+                                action = Some(Action::Toggle(update_key(name)));
+                            }
+                        }
+                        Some(Some((text, why))) => {
+                            let label = ui.label(RichText::new(*text).small().color(c.text_weak));
+                            if !why.is_empty() {
+                                label.on_hover_text(why);
+                            }
+                        }
+                        None => {}
                     }
                     let (text, colour, hint) = match installs {
                         Some(Installs::Count(n)) => {
@@ -1076,7 +1254,7 @@ impl App {
                 });
             })
             .response;
-        self.backdrop(ui, backdrop, response.rect, &k, viewing);
+        self.backdrop(ui, backdrop, response.rect, &k, viewing || reviewing);
         action
     }
 
@@ -1482,19 +1660,7 @@ impl App {
                     let Some(text) = text else { continue };
                     ui.add_space(8.0);
                     ui.label(RichText::new(f).font(theme::strong(12.5)).color(c.text));
-                    egui::ScrollArea::both().id_salt(("diff", key(p), f)).max_height(220.0).show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        // The two header lines repeat what is already said.
-                        for line in text.lines().skip(2).take(DIFF_LINES) {
-                            let colour = match line.as_bytes().first() {
-                                Some(b'+') => c.added,
-                                Some(b'-') => c.removed,
-                                Some(b'@') => c.text_weak,
-                                _ => c.text,
-                            };
-                            ui.add(egui::Label::new(mono(line.to_string(), colour)).extend());
-                        }
-                    });
+                    diff_view(ui, &text, ("diff", key(p), f));
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1620,6 +1786,29 @@ fn summary(ui: &mut egui::Ui, config: &Config, report: &Report, daemon: bool) ->
     action
 }
 
+/// A unified diff in a scrolling box, its lines coloured by what they do.
+fn diff_view(ui: &mut egui::Ui, text: &str, salt: impl egui::AsIdSalt) {
+    let c = colours();
+    egui::ScrollArea::both().id_salt(salt).max_height(220.0).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // The two header lines repeat what is already said.
+        for line in text.lines().skip(2).take(DIFF_LINES) {
+            let colour = match line.as_bytes().first() {
+                Some(b'+') => c.added,
+                Some(b'-') => c.removed,
+                Some(b'@') => c.text_weak,
+                _ => c.text,
+            };
+            ui.add(egui::Label::new(RichText::new(line).monospace().color(colour)).extend());
+        }
+    });
+}
+
+/// `1 update`, `3 updates`.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
+}
+
 fn group_heading(ui: &mut egui::Ui, title: &str, count: &str) {
     let c = colours();
     ui.horizontal(|ui| {
@@ -1665,6 +1854,11 @@ fn chip(ui: &mut egui::Ui, text: &str, picked: bool) -> egui::Response {
         painter.galley(rect.center() - galley.size() / 2.0, galley, colour);
     }
     response
+}
+
+/// Identifies the review of a skill's newer version.
+fn update_key(skill: &str) -> String {
+    format!("update|{skill}")
 }
 
 fn view_key(skill: &str) -> String {
