@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/icon.png" width="128" alt=""></p>
+<p align="center"><img src="icon.svg" width="128" height="128" alt=""></p>
 
 <h1 align="center">Skillster</h1>
 
@@ -113,5 +113,5 @@ Pushing a `v*` tag builds Windows (x64 and ARM64) and publishes a GitHub release
 | `src/pick.rs` | The folder menus |
 | `src/logger.rs` | The log file |
 | `src/platform/` | What differs per OS: links, folders, path syntax, autostart |
-| `icon/` | The icon's source: `icon.json` (its hue, grid and Mark), `mark.ts` (how the Mark is drawn) and the kit that renders it. `bun icon/mark.ts && bun icon/kit/render.ts icon/icon.json` rewrites the files in `assets/` |
+| `icon.svg` | The App icon and its source: the picture, with its Dials (hue, grid, Mark) inside. The solar-enterprise-app-icon kit redraws `icon.svg` and the files in `assets/` from it |
 | `assets/` | The rendered icon (`icon.png`, and `icon.ico` embedded in the Windows executables by `build.rs`); the window's fonts (Inter, JetBrains Mono, under the SIL Open Font License) |
